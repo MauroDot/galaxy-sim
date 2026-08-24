@@ -21,6 +21,33 @@ const STAR_TYPES = [
 // doesn't age, doesn't go supernova, and isn't part of the distribution).
 const CORE_TYPE_CODE = 255;
 
+// Sentinel type code for a wandering black hole (also not a spectral-type
+// star: immortal, point-mass, absorbs nearby stars instead of aging out).
+const BLACKHOLE_TYPE_CODE = 254;
+
+// Rare-event tuning for black holes: rolled per disk-star slot at
+// generation time, so the expected count scales with galaxy size
+// (0.3% * 500 =~ 1.5, i.e. "1-2 per 500-star galaxy").
+const BLACKHOLE_SPAWN_CHANCE = 0.003;
+// Spec calls for 1e7 solar masses, but this sim's G (0.6) and distances were
+// already calibrated around a much smaller mass range: individual stars top
+// out around ~80 and the galaxy's own central anchor is n*60 (30000 for a
+// 500-star galaxy). Plugging a literal 1e7 into that SAME G, unmodified,
+// makes the black hole ~300x the core - empirically (see scratchpad
+// test_bh_calibrate*.js) that devoured 498/500 stars within 10 seconds,
+// leaving nothing to "orbit naturally" and defeating the rest of the sim.
+// Calibrated down to match the core's own mass instead: still ~400x any
+// star (reads as clearly dominant/supermassive), captures a visible stream
+// of nearby stars within the first 30s, but leaves most of the galaxy
+// intact and orbiting for a multi-minute session. The info panel displays
+// this same value, so what's shown always matches what's actually simulated.
+const BLACKHOLE_MASS = 30000;
+const BLACKHOLE_CAPTURE_RADIUS = 70; // sim units; a star this close is absorbed
+// Stylized (not physically accurate) "event horizon" for the info panel -
+// real Schwarzschild radii are tiny compared to these sim units, so this is
+// an approximation chosen purely for in-panel flavor, as specified.
+const BLACKHOLE_EVENT_HORIZON_FACTOR = 3;
+
 // Cumulative weights for O(types) weighted sampling, e.g. [1,3,7,14,25,40,100].
 const STAR_TYPE_CUMULATIVE = (() => {
   let sum = 0;
@@ -43,9 +70,18 @@ function starTypeByCode(code) {
 if (typeof self !== 'undefined') {
   self.STAR_TYPES = STAR_TYPES;
   self.CORE_TYPE_CODE = CORE_TYPE_CODE;
+  self.BLACKHOLE_TYPE_CODE = BLACKHOLE_TYPE_CODE;
+  self.BLACKHOLE_SPAWN_CHANCE = BLACKHOLE_SPAWN_CHANCE;
+  self.BLACKHOLE_MASS = BLACKHOLE_MASS;
+  self.BLACKHOLE_CAPTURE_RADIUS = BLACKHOLE_CAPTURE_RADIUS;
+  self.BLACKHOLE_EVENT_HORIZON_FACTOR = BLACKHOLE_EVENT_HORIZON_FACTOR;
   self.pickStarTypeIndex = pickStarTypeIndex;
   self.starTypeByCode = starTypeByCode;
 }
 if (typeof module !== 'undefined') {
-  module.exports = { STAR_TYPES, CORE_TYPE_CODE, pickStarTypeIndex, starTypeByCode };
+  module.exports = {
+    STAR_TYPES, CORE_TYPE_CODE, pickStarTypeIndex, starTypeByCode,
+    BLACKHOLE_TYPE_CODE, BLACKHOLE_SPAWN_CHANCE, BLACKHOLE_MASS,
+    BLACKHOLE_CAPTURE_RADIUS, BLACKHOLE_EVENT_HORIZON_FACTOR,
+  };
 }

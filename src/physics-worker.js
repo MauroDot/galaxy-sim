@@ -1,7 +1,10 @@
 // physics-worker.js
 // Owns the simulation state and advances it with Barnes-Hut gravity,
 // off the main thread so rendering stays smooth. Also ages stars and
-// triggers supernovae when a star's age reaches its main-sequence lifetime.
+// triggers supernovae when a star's age reaches its main-sequence lifetime,
+// and absorbs any star that strays within a black hole's capture radius.
+// Black holes need no special gravity code - they're just very massive
+// point bodies in the same quadtree/integration loop as everything else.
 
 importScripts('quadtree.js', 'star-types.js', 'galaxy.js');
 
@@ -18,7 +21,10 @@ const TICK_MS = 1000 / 60;
 // or ~15-20s once you push the speed slider to 10x+.
 const YEARS_PER_TICK = 833;
 
-let state = null;        // { x, y, vx, vy, mass, type, radius, age, lifetime, alive } (typed-array-backed)
+const CAPTURE_RADIUS_SQ = BLACKHOLE_CAPTURE_RADIUS * BLACKHOLE_CAPTURE_RADIUS;
+
+let state = null;        // { x, y, vx, vy, mass, type, radius, age, lifetime, alive,
+                          //   blackHoleIndices, absorbedCount } (typed-array-backed)
 let seed = 1;
 let numStars = 500;
 let params = {};
@@ -49,8 +55,9 @@ function buildTree(s) {
   return tree;
 }
 
-// Advance physics by one fixed step, age every living star, and report any
-// stars that cross their lifetime this step (supernova).
+// Advance physics by one fixed step, age every living star, absorb any star
+// that has strayed within a black hole's capture radius, and report both
+// kinds of removal events (supernova, absorption) for this step.
 function step(s) {
   const tree = buildTree(s);
   const n = s.n;
@@ -72,8 +79,30 @@ function step(s) {
     s.y[i] += s.vy[i] * DT;
   }
 
+  // Black hole capture: any ordinary star that has drifted within
+  // CAPTURE_RADIUS of a black hole is absorbed and removed from the sim.
+  // Cheap (n * numBlackHoles distance checks, and there are only ever 0-2),
+  // so it runs every step with no measurable cost.
+  const absorbed = [];
+  if (s.blackHoleIndices.length) {
+    for (let i = 1; i < n; i++) {
+      if (!s.alive[i] || s.type[i] === BLACKHOLE_TYPE_CODE) continue;
+      for (const bhIdx of s.blackHoleIndices) {
+        const dx = s.x[i] - s.x[bhIdx];
+        const dy = s.y[i] - s.y[bhIdx];
+        if (dx * dx + dy * dy < CAPTURE_RADIUS_SQ) {
+          s.alive[i] = 0;
+          s.absorbedCount[bhIdx] = (s.absorbedCount[bhIdx] || 0) + 1;
+          absorbed.push({ starIndex: i, blackHoleIndex: bhIdx });
+          break;
+        }
+      }
+    }
+  }
+
   // Age stars (skip index 0, the immortal central mass) and collect any
-  // that just died so the caller can broadcast supernova events.
+  // that just died so the caller can broadcast supernova events. Black
+  // holes carry lifetime=Infinity so this never fires for them.
   const died = [];
   for (let i = 1; i < n; i++) {
     if (!s.alive[i]) continue;
@@ -85,7 +114,7 @@ function step(s) {
   }
 
   stepCount++;
-  return died;
+  return { died, absorbed };
 }
 
 function initSim(newSeed, newNumStars, newParams) {
@@ -93,7 +122,17 @@ function initSim(newSeed, newNumStars, newParams) {
   numStars = newNumStars;
   params = newParams || {};
   const g = generateGalaxy(seed, numStars, params);
-  state = { ...g, alive: new Uint8Array(g.n).fill(1) };
+
+  const blackHoleIndices = [];
+  const absorbedCount = {};
+  for (let i = 0; i < g.n; i++) {
+    if (g.type[i] === BLACKHOLE_TYPE_CODE) {
+      blackHoleIndices.push(i);
+      absorbedCount[i] = 0;
+    }
+  }
+
+  state = { ...g, alive: new Uint8Array(g.n).fill(1), blackHoleIndices, absorbedCount };
   acc = 0;
   stepCount = 0;
   postMessage({
@@ -104,6 +143,7 @@ function initSim(newSeed, newNumStars, newParams) {
     starType: Array.from(state.type),
     radius: Array.from(state.radius),
     lifetime: Array.from(state.lifetime),
+    blackHoleCount: blackHoleIndices.length,
   });
   postPositions();
 }
@@ -123,11 +163,13 @@ function tick() {
   acc += speed;
   let stepped = false;
   const allDied = [];
+  const allAbsorbed = [];
   // Cap substeps per tick so a runaway speed value can't stall the worker.
   let guard = 0;
   while (acc >= 1 && guard < 240) {
-    const died = step(state);
+    const { died, absorbed } = step(state);
     if (died.length) allDied.push(...died);
+    if (absorbed.length) allAbsorbed.push(...absorbed);
     acc -= 1;
     stepped = true;
     guard++;
@@ -140,6 +182,18 @@ function tick() {
       x: state.x[i],
       y: state.y[i],
       starType: state.type[i],
+    });
+  }
+  for (const { starIndex, blackHoleIndex } of allAbsorbed) {
+    postMessage({
+      type: 'absorption',
+      starIndex,
+      blackHoleIndex,
+      // Flash at the black hole's position, not the star's - that's where
+      // the visual event reads as happening.
+      x: state.x[blackHoleIndex],
+      y: state.y[blackHoleIndex],
+      absorbedCount: state.absorbedCount[blackHoleIndex],
     });
   }
 }
@@ -159,6 +213,7 @@ function pause() {
 
 function sendStarInfo(index) {
   if (!state || index < 0 || index >= state.n) return;
+  const isBlackHole = state.type[index] === BLACKHOLE_TYPE_CODE;
   postMessage({
     type: 'starInfo',
     index,
@@ -168,6 +223,8 @@ function sendStarInfo(index) {
     age: state.age[index],
     lifetime: state.lifetime[index],
     alive: !!state.alive[index],
+    isBlackHole,
+    absorbed: isBlackHole ? (state.absorbedCount[index] || 0) : 0,
   });
 }
 

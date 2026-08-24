@@ -15,6 +15,7 @@ class Renderer {
     this.colors = null;      // per-star color string, computed once at 'ready'
     this.pixelRadius = null; // per-star on-screen radius (device px), computed once at 'ready'
     this.alive = null;       // Uint8Array mirror of worker's alive flags, for skipping dead stars
+    this.isBlackHole = null; // Uint8Array: which indices render as black holes
 
     this.particles = []; // supernova burst particles: {x,y,vx,vy,born,color} in world space
     this._lastFrameTime = null;
@@ -112,9 +113,18 @@ class Renderer {
   setStarMeta(starType, radius, n) {
     const colors = new Array(n);
     const pixelRadius = new Float32Array(n);
+    const isBlackHole = new Uint8Array(n);
     colors[0] = 'rgba(255,246,214,1)'; // central mass
     pixelRadius[0] = 0; // drawn specially (glow), see draw()
     for (let i = 1; i < n; i++) {
+      if (starType[i] === BLACKHOLE_TYPE_CODE) {
+        // Fixed on-screen size regardless of mass: the real radius is ~0
+        // (a point mass), so this is purely a legibility choice.
+        isBlackHole[i] = 1;
+        pixelRadius[i] = 6 * this.dpr;
+        colors[i] = '#160821';
+        continue;
+      }
       const st = starTypeByCode(starType[i]);
       colors[i] = st ? st.color : '#ffffff';
       // Map world-unit radius (1..10) to a small on-screen dot size, with a
@@ -123,6 +133,7 @@ class Renderer {
     }
     this.colors = colors;
     this.pixelRadius = pixelRadius;
+    this.isBlackHole = isBlackHole;
     this.alive = new Uint8Array(n).fill(1);
   }
 
@@ -131,17 +142,26 @@ class Renderer {
   }
 
   // Spawn a burst of ephemeral, gravity-free particles at a world position.
-  spawnBurst(wx, wy, color) {
-    const count = 100 + Math.floor(Math.random() * 101); // 100-200
+  // opts: { countMin, countMax, life (seconds), speedMin, speedMax }
+  // Defaults match the supernova burst (100-200 particles, 0.5s); pass
+  // smaller/quicker values for e.g. a black-hole absorption flash.
+  spawnBurst(wx, wy, color, opts = {}) {
+    const countMin = opts.countMin ?? 100;
+    const countMax = opts.countMax ?? 200;
+    const life = opts.life ?? 0.5;
+    const speedMin = opts.speedMin ?? 40;
+    const speedMax = opts.speedMax ?? 260;
+    const count = countMin + Math.floor(Math.random() * (countMax - countMin + 1));
     const now = performance.now();
     for (let i = 0; i < count; i++) {
       const angle = Math.random() * Math.PI * 2;
-      const speed = 40 + Math.random() * 220; // world units / second
+      const speed = speedMin + Math.random() * (speedMax - speedMin);
       this.particles.push({
         x: wx, y: wy,
         vx: Math.cos(angle) * speed,
         vy: Math.sin(angle) * speed,
         born: now,
+        life,
         color,
       });
     }
@@ -152,7 +172,7 @@ class Renderer {
     const alive = [];
     for (const p of this.particles) {
       const age = (now - p.born) / 1000;
-      if (age >= 0.5) continue;
+      if (age >= p.life) continue;
       p.x += p.vx * dtSec;
       p.y += p.vy * dtSec;
       alive.push(p);
@@ -167,7 +187,7 @@ class Renderer {
     const zoom = camera.zoom * dpr;
     for (const p of this.particles) {
       const age = (now - p.born) / 1000;
-      const alpha = Math.max(0, 1 - age / 0.5);
+      const alpha = Math.max(0, 1 - age / p.life);
       const sx = cx + (p.x - camera.x) * zoom;
       const sy = cy + (p.y - camera.y) * zoom;
       ctx.globalAlpha = alpha;
@@ -213,6 +233,19 @@ class Renderer {
           ctx.arc(sx, sy, r * 6, 0, Math.PI * 2);
           ctx.fill();
           ctx.fillStyle = 'rgba(255,252,235,1)';
+          ctx.beginPath();
+          ctx.arc(sx, sy, r, 0, Math.PI * 2);
+          ctx.fill();
+        } else if (this.isBlackHole && this.isBlackHole[i]) {
+          const r = this.pixelRadius[i];
+          // Subtle glowing ring first (lighter purple, semi-transparent, 1.5x radius)...
+          ctx.strokeStyle = 'rgba(176,120,255,0.55)';
+          ctx.lineWidth = Math.max(1, 1.1 * dpr);
+          ctx.beginPath();
+          ctx.arc(sx, sy, r * 1.5, 0, Math.PI * 2);
+          ctx.stroke();
+          // ...then a solid, non-sparkly dark-purple/black disc on top.
+          ctx.fillStyle = this.colors[i];
           ctx.beginPath();
           ctx.arc(sx, sy, r, 0, Math.PI * 2);
           ctx.fill();

@@ -4,7 +4,8 @@
 // star-types.js so STAR_TYPES/CORE_TYPE_CODE/pickStarTypeIndex are already
 // in scope as globals).
 
-/* global STAR_TYPES, CORE_TYPE_CODE, pickStarTypeIndex */
+/* global STAR_TYPES, CORE_TYPE_CODE, pickStarTypeIndex, BLACKHOLE_TYPE_CODE,
+   BLACKHOLE_SPAWN_CHANCE, BLACKHOLE_MASS */
 // Node/CommonJS test-harness path only (browsers/workers get these as
 // globals via importScripts, since star-types.js is loaded first there).
 // This intentionally avoids any top-level var/let/const of its own: in a
@@ -58,6 +59,11 @@ function randn(rand) {
  * generated galaxy isn't perfectly coeval - some stars are already close to
  * the end of their lives, which staggers supernovae naturally once the sim
  * is running instead of producing a single synchronized burst.
+ * A small fraction of disk slots (BLACKHOLE_SPAWN_CHANCE) become wandering
+ * black holes instead of stars: supermassive point bodies (radius 0, no
+ * lifetime) placed the same way as any other disk body but given a near-zero
+ * drift velocity instead of an orbital one, so they sit and pull the disk
+ * around them rather than orbiting the core themselves.
  *
  * @param {number|string} seed
  * @param {number} numStars total bodies, including the central mass (index 0)
@@ -111,6 +117,20 @@ function generateGalaxy(seed, numStars, opts = {}) {
     const py = r * Math.sin(theta);
     x[i] = px;
     y[i] = py;
+
+    if (rand() < BLACKHOLE_SPAWN_CHANCE) {
+      // A rare wandering black hole: supermassive point mass, immortal,
+      // essentially stationary (a small drift instead of an orbital
+      // velocity - it perturbs the disk rather than following it).
+      type[i] = BLACKHOLE_TYPE_CODE;
+      mass[i] = BLACKHOLE_MASS;
+      radius[i] = 0;
+      lifetime[i] = Infinity;
+      age[i] = 0;
+      vx[i] = (rand() - 0.5) * 4;
+      vy[i] = (rand() - 0.5) * 4;
+      continue;
+    }
 
     // Spectral type -> base mass/radius/lifetime, each with independent
     // jitter so stars of the same type aren't identical.

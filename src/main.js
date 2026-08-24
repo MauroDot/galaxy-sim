@@ -18,11 +18,18 @@
     starStat: document.getElementById('starStat'),
     physStat: document.getElementById('physStat'),
     supernovaStat: document.getElementById('supernovaStat'),
+    blackHoleStat: document.getElementById('blackHoleStat'),
+    absorptionStat: document.getElementById('absorptionStat'),
     infoPanel: document.getElementById('info-panel'),
-    infoType: document.getElementById('infoType'),
-    infoMass: document.getElementById('infoMass'),
-    infoAge: document.getElementById('infoAge'),
-    infoLifetime: document.getElementById('infoLifetime'),
+    infoTitle: document.getElementById('infoTitle'),
+    infoLabel1: document.getElementById('infoLabel1'),
+    infoValue1: document.getElementById('infoValue1'),
+    infoLabel2: document.getElementById('infoLabel2'),
+    infoValue2: document.getElementById('infoValue2'),
+    infoLabel3: document.getElementById('infoLabel3'),
+    infoValue3: document.getElementById('infoValue3'),
+    infoLabel4: document.getElementById('infoLabel4'),
+    infoValue4: document.getElementById('infoValue4'),
     infoFlash: document.getElementById('infoFlash'),
   };
 
@@ -32,6 +39,7 @@
   let lastStepSeen = -1;
   let physStepsAtLastFpsCheck = 0;
   let supernovaCount = 0;
+  let absorptionCount = 0;
   let selectedIndex = -1;
   let infoPollTimer = null;
   let flashTimer = null;
@@ -92,9 +100,16 @@
   function init(seed, numStars) {
     els.seed.value = seed;
     supernovaCount = 0;
+    absorptionCount = 0;
     els.supernovaStat.textContent = '0';
+    els.absorptionStat.textContent = '0';
     selectedIndex = -1;
     hideInfoPanel();
+    // The worker's step counter restarts at 0 for the new galaxy; without
+    // this the next FPS sample window diffs against the old (much larger)
+    // step count and briefly shows a negative Physics Hz.
+    lastStepSeen = -1;
+    physStepsAtLastFpsCheck = -1;
     worker.postMessage({ type: 'init', seed, numStars });
   }
 
@@ -108,6 +123,18 @@
     return Math.round(y) + ' yr';
   }
 
+  // Compact large-number formatting (k/M/B suffixes), used for masses and
+  // the stylized black-hole event horizon - both can range from ~0.4 (a
+  // small star) up into the tens of millions (a black hole).
+  function formatCompact(n) {
+    if (!Number.isFinite(n)) return '∞';
+    const abs = Math.abs(n);
+    if (abs >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+    if (abs >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+    if (abs >= 1e3) return (n / 1e3).toFixed(2) + 'k';
+    return n.toFixed(2);
+  }
+
   function hideInfoPanel() {
     els.infoPanel.classList.add('hidden');
     if (infoPollTimer) {
@@ -116,14 +143,35 @@
     }
   }
 
-  function showStarInfo(info) {
-    const st = (window.STAR_TYPES || []).find((t) => t.code === info.starType);
+  function showBodyInfo(info) {
     els.infoPanel.classList.remove('hidden');
-    els.infoType.textContent = st ? `${st.label} - ${st.colorName}` : 'Core';
-    els.infoType.style.color = st ? st.color : '#fff6d6';
-    els.infoMass.textContent = info.mass.toFixed(2) + ' M☉';
-    els.infoAge.textContent = formatYears(info.age);
-    els.infoLifetime.textContent = formatYears(info.lifetime);
+
+    if (info.isBlackHole) {
+      els.infoTitle.textContent = 'Black Hole';
+      els.infoLabel1.textContent = 'Type';
+      els.infoValue1.textContent = 'Black Hole';
+      els.infoValue1.style.color = '#c79bff';
+      els.infoLabel2.textContent = 'Mass';
+      els.infoValue2.textContent = formatCompact(info.mass) + ' M☉';
+      els.infoLabel3.textContent = 'Event Horizon';
+      els.infoValue3.textContent = formatCompact(info.mass * BLACKHOLE_EVENT_HORIZON_FACTOR) + ' units';
+      els.infoLabel4.textContent = 'Stars absorbed';
+      els.infoValue4.textContent = String(info.absorbed || 0);
+      els.infoFlash.classList.add('hidden');
+      return;
+    }
+
+    const st = (window.STAR_TYPES || []).find((t) => t.code === info.starType);
+    els.infoTitle.textContent = st ? 'Star' : 'Core';
+    els.infoLabel1.textContent = 'Type';
+    els.infoValue1.textContent = st ? `${st.label} - ${st.colorName}` : 'Core';
+    els.infoValue1.style.color = st ? st.color : '#fff6d6';
+    els.infoLabel2.textContent = 'Mass';
+    els.infoValue2.textContent = formatCompact(info.mass) + ' M☉';
+    els.infoLabel3.textContent = 'Age';
+    els.infoValue3.textContent = formatYears(info.age);
+    els.infoLabel4.textContent = 'Lifetime';
+    els.infoValue4.textContent = formatYears(info.lifetime);
     if (!info.alive) {
       els.infoFlash.textContent = '\u{1F4A5} Supernova!';
       els.infoFlash.classList.remove('hidden');
@@ -174,12 +222,8 @@
   els.playPause.addEventListener('click', () => setPlaying(!playing));
 
   els.reset.addEventListener('click', () => {
-    worker.postMessage({ type: 'reset', seed: currentSeed(), numStars: currentStarCount() });
+    init(currentSeed(), currentStarCount());
     renderer.resetCamera();
-    supernovaCount = 0;
-    els.supernovaStat.textContent = '0';
-    selectedIndex = -1;
-    hideInfoPanel();
     setPlaying(true);
   });
 
@@ -210,6 +254,7 @@
     if (msg.type === 'ready') {
       renderer.setStarMeta(msg.starType, msg.radius, msg.n);
       els.starStat.textContent = String(msg.n);
+      els.blackHoleStat.textContent = String(msg.blackHoleCount);
     } else if (msg.type === 'positions') {
       latestPositions = msg.buf;
       latestN = msg.n;
@@ -224,8 +269,18 @@
       if (msg.index === selectedIndex) {
         flashSupernovaBanner();
       }
+    } else if (msg.type === 'absorption') {
+      renderer.markDead(msg.starIndex);
+      // Brief white flash at the black hole, smaller/quicker than a supernova.
+      renderer.spawnBurst(msg.x, msg.y, '#ffffff', {
+        countMin: 10, countMax: 20, life: 0.3, speedMin: 20, speedMax: 120,
+      });
+      absorptionCount++;
+      els.absorptionStat.textContent = String(absorptionCount);
+      // The selected black hole's "Stars absorbed" count is kept current by
+      // the periodic getStarInfo poll below - no extra push needed here.
     } else if (msg.type === 'starInfo') {
-      if (msg.index === selectedIndex) showStarInfo(msg);
+      if (msg.index === selectedIndex) showBodyInfo(msg);
     }
   };
 
