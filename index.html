@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Galaxy N-Body Simulator</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <canvas id="sim-canvas"></canvas>
+
+  <div id="ui-panel">
+    <h1>Galaxy Sim</h1>
+
+    <div class="row">
+      <button id="playPauseBtn">⏸ Pause</button>
+      <button id="resetBtn">⟲ Reset</button>
+    </div>
+
+    <div class="row">
+      <label for="speedSlider">Speed <span id="speedLabel">1.00x</span></label>
+      <input id="speedSlider" type="range" min="0" max="20" step="0.25" value="1" />
+    </div>
+
+    <div class="row">
+      <label for="seedInput">Seed</label>
+      <input id="seedInput" type="text" placeholder="seed" />
+    </div>
+
+    <div class="row">
+      <label for="starCountInput">Stars</label>
+      <input id="starCountInput" type="number" min="10" max="3000" value="500" />
+    </div>
+
+    <div class="row">
+      <button id="regenBtn">🎲 New Galaxy</button>
+    </div>
+
+    <div id="stats">
+      <div>FPS: <span id="fpsStat">-</span></div>
+      <div>Physics Hz: <span id="physStat">-</span></div>
+      <div>Stars: <span id="starStat">-</span></div>
+      <div>Supernovae: <span id="supernovaStat">0</span></div>
+    </div>
+
+    <div id="legend">
+      <span style="color:#4d6dff">O</span>
+      <span style="color:#a6c0ff">B</span>
+      <span style="color:#ffffff">A</span>
+      <span style="color:#fff5d1">F</span>
+      <span style="color:#ffe066">G</span>
+      <span style="color:#ffa347">K</span>
+      <span style="color:#ff4d4d">M</span>
+    </div>
+
+    <p class="hint">Scroll to zoom · Drag to pan · Space to play/pause · Click a star for info</p>
+  </div>
+
+  <div id="info-panel" class="hidden">
+    <h2>Star</h2>
+    <div class="info-row">Type <span id="infoType">-</span></div>
+    <div class="info-row">Mass <span id="infoMass">-</span></div>
+    <div class="info-row">Age <span id="infoAge">-</span></div>
+    <div class="info-row">Lifetime <span id="infoLifetime">-</span></div>
+    <div id="infoFlash" class="hidden"></div>
+  </div>
+
+  <script src="src/star-types.js"></script>
+  <script src="src/renderer.js"></script>
+  <script src="src/main.js"></script>
+</body>
+</html>
