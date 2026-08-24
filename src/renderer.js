@@ -39,6 +39,14 @@ class Renderer {
     this.focusIndex = -1;    // index of the star being zoomed into, in system mode
     this.systemMeta = {};    // slot index -> planet metadata (orbitRadius, moons, ...)
 
+    // The core (index 0) is a supermassive black hole that grows by eating
+    // wandering black holes/quasars - main.js updates coreMass live as that
+    // happens; initialCoreMass (set once, at 'ready') is the baseline its
+    // glow size/brightness are scaled relative to, so the existing tuned
+    // look at a fresh galaxy's starting mass is unchanged (ratio 1).
+    this.coreMass = null;
+    this.initialCoreMass = null;
+
     this.particles = []; // ephemeral burst particles: {x,y,vx,vy,born,life,color} in world space
     this._lastFrameTime = null;
     this._lastHoverX = -9999;
@@ -399,15 +407,35 @@ class Renderer {
         ctx.fillStyle = this.colors[i] || 'rgba(220,220,255,0.9)';
 
         if (i === 0) {
-          const r = Math.max(3, 4 * dpr);
-          const grad = ctx.createRadialGradient(sx, sy, 0, sx, sy, r * 6);
-          grad.addColorStop(0, 'rgba(255,246,214,0.9)');
-          grad.addColorStop(1, 'rgba(255,246,214,0)');
+          // The core is itself a supermassive black hole: dark center, with
+          // an outer glow whose size (sqrt(mass)) and brightness grow as it
+          // consumes wandering black holes/quasars. growthRatio is 1 at the
+          // galaxy's starting core mass, so a fresh galaxy looks exactly as
+          // before - it only visibly swells once it's eaten something.
+          const growthRatio = this.initialCoreMass
+            ? Math.max(1, (this.coreMass ?? this.initialCoreMass) / this.initialCoreMass)
+            : 1;
+          const glowScale = Math.sqrt(growthRatio);
+          const r = Math.max(3.5, 4.5 * dpr); // dark center stays a fixed size
+          const glowR = r * 6 * glowScale;
+          const brightness = Math.min(1, 0.6 + 0.4 * Math.min(1, glowScale - 1));
+
+          const grad = ctx.createRadialGradient(sx, sy, 0, sx, sy, glowR);
+          grad.addColorStop(0, `rgba(190,145,255,${brightness})`);
+          grad.addColorStop(0.55, `rgba(150,95,255,${brightness * 0.35})`);
+          grad.addColorStop(1, 'rgba(150,95,255,0)');
           ctx.fillStyle = grad;
           ctx.beginPath();
-          ctx.arc(sx, sy, r * 6, 0, Math.PI * 2);
+          ctx.arc(sx, sy, glowR, 0, Math.PI * 2);
           ctx.fill();
-          ctx.fillStyle = 'rgba(255,252,235,1)';
+
+          ctx.strokeStyle = `rgba(205,170,255,${Math.min(1, brightness + 0.15)})`;
+          ctx.lineWidth = Math.max(1.2, 1.6 * dpr);
+          ctx.beginPath();
+          ctx.arc(sx, sy, glowR * 0.5, 0, Math.PI * 2);
+          ctx.stroke();
+
+          ctx.fillStyle = '#0d0616';
           ctx.beginPath();
           ctx.arc(sx, sy, r, 0, Math.PI * 2);
           ctx.fill();

@@ -29,6 +29,8 @@
     supernovaStat: document.getElementById('supernovaStat'),
     blackHoleStat: document.getElementById('blackHoleStat'),
     absorptionStat: document.getElementById('absorptionStat'),
+    coreGrowthRow: document.getElementById('coreGrowthRow'),
+    coreGrowthStat: document.getElementById('coreGrowthStat'),
     modeIndicator: document.getElementById('modeIndicator'),
     backBtn: document.getElementById('backToGalaxyBtn'),
     overlay: document.getElementById('transition-overlay'),
@@ -64,6 +66,7 @@
   let infoPollTimer = null;
   let flashTimer = null;
   let bodyMass = null; // full mass array from 'ready', for instant tooltip lookups
+  let coreConsumedCount = 0; // black holes/quasars the core has eaten this session
 
   // --- Sol System zoom state ---
   let mode = 'galaxy'; // 'galaxy' | 'system'
@@ -151,8 +154,10 @@
     activeSeed = seed;
     supernovaCount = 0;
     absorptionCount = 0;
+    coreConsumedCount = 0;
     els.supernovaStat.textContent = '0';
     els.absorptionStat.textContent = '0';
+    els.coreGrowthRow.classList.add('hidden');
     selectedIndex = -1;
     hideInfoPanel();
     resetToGalaxyUI();
@@ -202,6 +207,19 @@
     if (typeCode === CORE_TYPE_CODE) return 'Sol';
     const st = (window.STAR_TYPES || []).find((t) => t.code === typeCode);
     return st ? `${st.label}-type (${formatCompact(mass)} M☉)` : 'Star';
+  }
+
+  // Shows/hides the "Core Growth: 30.0k -> 45.2k M☉" stat - only relevant
+  // (and only shown) once the core has actually consumed something, since
+  // before that it'd just be a redundant "30.0k -> 30.0k".
+  function updateCoreGrowthStat() {
+    if (coreConsumedCount > 0 && renderer.initialCoreMass != null) {
+      els.coreGrowthStat.textContent =
+        formatCompact(renderer.initialCoreMass) + ' → ' + formatCompact(renderer.coreMass) + ' M☉';
+      els.coreGrowthRow.classList.remove('hidden');
+    } else {
+      els.coreGrowthRow.classList.add('hidden');
+    }
   }
 
   // --- localStorage persistence (main-thread only - a Worker has no
@@ -329,8 +347,25 @@
     if (info.isPlanet) return showPlanetInfo(info);
     if (info.starType === QUASAR_TYPE_CODE) return showQuasarInfo(info);
     if (info.starType === NEUTRONSTAR_TYPE_CODE) return showNeutronStarInfo(info);
-    if (info.isBlackHole) return showBlackHoleInfo(info); // literal black hole
+    if (info.starType === CORE_TYPE_CODE) return showCoreInfo(info);
+    if (info.isBlackHole) return showBlackHoleInfo(info); // literal wandering black hole
     return showStarInfo(info);
+  }
+
+  function showCoreInfo(info) {
+    setInfoRows('Supermassive Black Hole (Core)', [
+      ['Type', 'Supermassive BH (Core)', '#c9a6ff'],
+      ['Mass', formatCompact(info.mass) + ' M☉'],
+      ['Event Horizon', formatCompact(info.mass * BLACKHOLE_EVENT_HORIZON_FACTOR) + ' units'],
+      ['Black holes consumed', String(info.coreConsumedCount || 0)],
+    ]);
+    // The core is still "Sol" - always a valid zoom target, unlike an
+    // ordinary wandering black hole/quasar.
+    if (!(mode === 'system' && focusIndex === info.index)) {
+      els.infoAction.textContent = 'View System →';
+      els.infoAction.classList.remove('hidden');
+      els.infoAction.onclick = () => enterSystem(info.index);
+    }
   }
 
   function showBlackHoleInfo(info) {
@@ -361,9 +396,11 @@
   }
 
   function showStarInfo(info) {
+    // Reaches here only for genuine spectral-type stars - the core
+    // (CORE_TYPE_CODE) is dispatched to showCoreInfo before this is called.
     const st = (window.STAR_TYPES || []).find((t) => t.code === info.starType);
-    setInfoRows(st ? 'Star' : 'Core', [
-      ['Type', st ? `${st.label} - ${st.colorName}` : 'Core', st ? st.color : '#fff6d6'],
+    setInfoRows('Star', [
+      ['Type', st ? `${st.label} - ${st.colorName}` : 'Unknown', st ? st.color : '#fff6d6'],
       ['Mass', formatCompact(info.mass) + ' M☉'],
       ['Age', formatYears(info.age)],
       ['Lifetime', formatYears(info.lifetime)],
@@ -443,7 +480,10 @@
   // --- Hover tooltips ---
 
   function tooltipTextForIndex(idx) {
-    if (idx === 0) return `Sol (Core) · ${formatCompact(bodyMass ? bodyMass[0] : 0)} M☉`;
+    if (idx === 0) {
+      const mass = renderer.coreMass != null ? renderer.coreMass : (bodyMass ? bodyMass[0] : 0);
+      return `Sol · Supermassive BH (Core) · ${formatCompact(mass)} M☉`;
+    }
     const typeCode = renderer.starType ? renderer.starType[idx] : -1;
     if (typeCode === BLACKHOLE_TYPE_CODE) return `Black Hole · ${formatCompact(BLACKHOLE_MASS)} M☉ · absorbs nearby stars`;
     if (typeCode === QUASAR_TYPE_CODE) return `Quasar · ${formatCompact(QUASAR_DISPLAY_MASS)} M☉ (visual) · supermassive`;
@@ -536,6 +576,9 @@
     if (msg.type === 'ready') {
       renderer.setStarMeta(msg.starType, msg.radius, msg.n);
       bodyMass = msg.mass;
+      renderer.coreMass = msg.mass[0];
+      renderer.initialCoreMass = msg.mass[0];
+      updateCoreGrowthStat();
       els.starStat.textContent = String(msg.realStarCount);
       els.blackHoleStat.textContent = String(msg.blackHoleCount);
     } else if (msg.type === 'positions') {
@@ -562,6 +605,18 @@
       els.absorptionStat.textContent = String(absorptionCount);
       // The selected absorber's "Stars absorbed" count is kept current by
       // the periodic getStarInfo poll below - no extra push needed here.
+    } else if (msg.type === 'coreAbsorption') {
+      renderer.markDead(msg.blackHoleIndex);
+      renderer.coreMass = msg.newCoreMass;
+      coreConsumedCount = msg.coreConsumedCount;
+      // A bigger, brighter, purple-tinted burst - the core just ate a whole
+      // black hole, a rarer and more dramatic event than a star falling in.
+      renderer.spawnBurst(msg.x, msg.y, '#c9a6ff', {
+        countMin: 60, countMax: 100, life: 0.6, speedMin: 30, speedMax: 180,
+      });
+      updateCoreGrowthStat();
+      // If the core is currently selected, its info panel picks up the new
+      // mass/count via the existing periodic getStarInfo poll below.
     } else if (msg.type === 'starInfo') {
       if (msg.index === selectedIndex) showBodyInfo(msg);
     } else if (msg.type === 'systemReady') {

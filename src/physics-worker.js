@@ -7,6 +7,11 @@
 // on request. Black holes/quasars need no special gravity code - they're
 // just very massive point bodies in the same quadtree/integration loop as
 // everything else; planets are the same, at Earth-mass-converted scale.
+// The galactic core (index 0) is itself a supermassive black hole: it
+// consumes any wandering black hole/quasar that strays within its own
+// capture radius and grows its own mass by the absorbed body's mass - same
+// principle, the increased mass just flows into the next tree build/force
+// calc for free, no special gravity code needed there either.
 
 importScripts('quadtree.js', 'star-types.js', 'galaxy.js', 'system-bodies.js');
 
@@ -95,6 +100,31 @@ function step(s) {
     s.y[i] += s.vy[i] * DT;
   }
 
+  // Core consumption: the core (index 0) is itself a supermassive black
+  // hole and eats any wandering black hole/quasar within its own capture
+  // radius, growing its own mass by the absorbed body's mass. O(numAbsorbers)
+  // - always a handful at most - so this is effectively O(1) per step, no
+  // measurable cost. Runs before the star-absorption loop below so a body
+  // consumed this step is already gone from s.absorberIndices and can't
+  // also "capture" a star this same step via its now-frozen last position.
+  const coreAbsorptions = [];
+  if (s.absorberIndices.length) {
+    const stillHere = [];
+    for (const bhIdx of s.absorberIndices) {
+      const dx = s.x[bhIdx] - s.x[0];
+      const dy = s.y[bhIdx] - s.y[0];
+      if (dx * dx + dy * dy < CAPTURE_RADIUS_SQ) {
+        s.mass[0] += s.mass[bhIdx];
+        s.alive[bhIdx] = 0;
+        s.coreConsumedCount++;
+        coreAbsorptions.push({ blackHoleIndex: bhIdx, newCoreMass: s.mass[0] });
+      } else {
+        stillHere.push(bhIdx);
+      }
+    }
+    s.absorberIndices = stillHere;
+  }
+
   // Absorber capture: any ordinary body that has drifted within
   // CAPTURE_RADIUS of a black hole or quasar is absorbed and removed from
   // the sim (this can include a zoomed-in star's own planets, if a
@@ -133,7 +163,7 @@ function step(s) {
   }
 
   stepCount++;
-  return { died, absorbed };
+  return { died, absorbed, coreAbsorptions };
 }
 
 function initSim(newSeed, newNumStars, newParams) {
@@ -187,6 +217,7 @@ function initSim(newSeed, newNumStars, newParams) {
     realStarCount: g.n,
     absorberIndices,
     absorbedCount,
+    coreConsumedCount: 0,
     focusIndex: -1,
     focusSlotCount: 0,
     systemMeta: {},
@@ -225,12 +256,14 @@ function tick() {
   let stepped = false;
   const allDied = [];
   const allAbsorbed = [];
+  const allCoreAbsorptions = [];
   // Cap substeps per tick so a runaway speed value can't stall the worker.
   let guard = 0;
   while (acc >= 1 && guard < 240) {
-    const { died, absorbed } = step(state);
+    const { died, absorbed, coreAbsorptions } = step(state);
     if (died.length) allDied.push(...died);
     if (absorbed.length) allAbsorbed.push(...absorbed);
+    if (coreAbsorptions.length) allCoreAbsorptions.push(...coreAbsorptions);
     acc -= 1;
     stepped = true;
     guard++;
@@ -255,6 +288,16 @@ function tick() {
       x: state.x[blackHoleIndex],
       y: state.y[blackHoleIndex],
       absorbedCount: state.absorbedCount[blackHoleIndex],
+    });
+  }
+  for (const { blackHoleIndex, newCoreMass } of allCoreAbsorptions) {
+    postMessage({
+      type: 'coreAbsorption',
+      blackHoleIndex,
+      x: state.x[0],
+      y: state.y[0],
+      newCoreMass,
+      coreConsumedCount: state.coreConsumedCount,
     });
   }
 }
@@ -422,6 +465,7 @@ function sendStarInfo(index) {
     alive: !!state.alive[index],
     isBlackHole: absorberBody, // true for both black holes and quasars
     absorbed: absorberBody ? (state.absorbedCount[index] || 0) : 0,
+    coreConsumedCount: index === 0 ? state.coreConsumedCount : 0,
   };
   if (typeCode === PLANET_TYPE_CODE && state.systemMeta[index]) {
     const meta = state.systemMeta[index];
