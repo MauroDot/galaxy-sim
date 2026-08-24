@@ -567,6 +567,12 @@
       e.preventDefault();
       setPlaying(!playing);
     }
+    if (e.code === 'KeyD' && e.target === document.body) {
+      // Temporary debugging aid (bounding-box overlay) - safe to remove
+      // once planet visibility is confirmed fixed.
+      renderer.debugMode = !renderer.debugMode;
+      console.log('[main] debug bounding-box overlay:', renderer.debugMode ? 'ON' : 'OFF');
+    }
   });
 
   // --- Worker messages ---
@@ -623,6 +629,19 @@
       const entries = msg.slots.map((s) => ({ index: s.index, starType: PLANET_TYPE_CODE, radius: s.radiusPx, color: s.color }));
       renderer.applySlotMeta(entries);
       renderer.setSystemMeta(msg.slots);
+      // Temporary debug logging (per debugging request) - confirms the
+      // render side actually received and applied the slots, with their
+      // final pixel radius/color/alive state. Safe to remove once planet
+      // visibility is confirmed fixed.
+      console.log(
+        `[main] systemReady for star #${msg.starIndex} (wasGenerated=${msg.wasGenerated}): ${msg.slots.length} planet slot(s) applied`,
+        msg.slots.map((s) => ({
+          index: s.index, name: s.name,
+          pixelRadius: +renderer.pixelRadius[s.index].toFixed(2),
+          color: renderer.colors[s.index],
+          alive: !!renderer.alive[s.index],
+        }))
+      );
       renderer.mode = 'system';
       renderer.focusIndex = msg.starIndex;
       latestSystemSlots = msg.slots;

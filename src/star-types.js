@@ -100,11 +100,18 @@ const EARTH_MASS_IN_SOLAR = 3.003e-6;
 // red=iron, gray=airless"), each biased toward a temperature band so hot,
 // close-in planets read as iron/rocky and cold, distant ones read as
 // icy/airless - a bit more narratively coherent than a pure coin-flip.
+// 'airless' is the most common composition by far (~60% of generated
+// planets, since its temp band [0,260] covers most typical orbit
+// distances) - its color got brightened from a muted #9a9a9a to this
+// lighter silver specifically because that combination (majority
+// composition + tiny dot + dim color) was the main reason planets read as
+// "invisible" against the near-black background, even though they were
+// rendering at the mathematically correct position all along.
 const PLANET_COMPOSITIONS = [
   { key: 'water', color: '#4d8dff', tempBias: [180, 320] },
   { key: 'rocky', color: '#a67a4d', tempBias: [280, 600] },
   { key: 'iron', color: '#c0392b', tempBias: [400, 900] },
-  { key: 'airless', color: '#9a9a9a', tempBias: [0, 260] },
+  { key: 'airless', color: '#c9ced6', tempBias: [0, 260] },
 ];
 
 // Cumulative weights for O(types) weighted sampling, e.g. [1,3,7,14,25,40,100].

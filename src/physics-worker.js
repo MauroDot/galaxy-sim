@@ -432,6 +432,20 @@ function enterSystem(starIndex, saved) {
   state.focusIndex = starIndex;
   state.focusSlotCount = count;
 
+  // Temporary debug logging (per debugging request) - confirms the slots
+  // actually got populated with valid, host-relative coordinates. Safe to
+  // remove once planet visibility is confirmed fixed.
+  console.log(
+    `[physics-worker] enterSystem(${starIndex}): placed ${count} planet slot(s) ` +
+    `(host at ${hostX.toFixed(1)},${hostY.toFixed(1)}):`,
+    slots.map((s) => ({
+      index: s.index, name: s.name,
+      x: +state.x[s.index].toFixed(1), y: +state.y[s.index].toFixed(1),
+      relX: +(state.x[s.index] - hostX).toFixed(1), relY: +(state.y[s.index] - hostY).toFixed(1),
+      alive: !!state.alive[s.index],
+    }))
+  );
+
   // The new planets' positions only exist in worker state so far - tick()
   // is what normally broadcasts a fresh 'positions' buffer, but that only
   // fires while playing. Without this, entering a system while paused would

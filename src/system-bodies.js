@@ -93,7 +93,13 @@ function generateSystem(seed, starIndex, starMass, starTypeCode) {
     // far more small/mid planets than giants, same idea as a Kroupa-style
     // stellar IMF but simplified to a single log-uniform draw.
     const massEarth = Math.exp(rand() * (Math.log(300) - Math.log(0.3)) + Math.log(0.3));
-    const radiusPx = Math.min(3, Math.max(1, 0.6 + Math.cbrt(massEarth) * 0.35));
+    // Floor bumped from 1 to 1.8 (and max 3->4): a 1px-radius (2px diameter)
+    // dot was confirmed, via pixel-position debugging, to be technically
+    // rendering in the mathematically correct spot but was so small it read
+    // as "invisible" - not a pipeline bug, a legibility one. See renderer.js
+    // for the matching render-time floor (also covers systems saved to
+    // localStorage before this change).
+    const radiusPx = Math.min(4, Math.max(1.8, 0.9 + Math.cbrt(massEarth) * 0.4));
 
     const tempK = estimateTempK(tempHostMass, orbitRadius);
     const composition = pickComposition(tempK, rand);
@@ -119,6 +125,21 @@ function generateSystem(seed, starIndex, starMass, starTypeCode) {
       composition: composition.key, color: composition.color, tempK, moons,
     });
   }
+
+  // Temporary debug logging (per debugging request) - shows up in the
+  // browser's DevTools console since Chrome aggregates Worker console
+  // output into the main Console panel by default. Safe to remove once
+  // planet visibility is confirmed fixed; left in for now since it's cheap
+  // and only fires once per zoom-in (not per frame).
+  console.log(
+    `[system-bodies] generated ${planets.length} planet(s) for star #${starIndex} ` +
+    `(type=${starTypeCode}, mass=${starMass.toFixed(2)} M☉):`,
+    planets.map((p) => ({
+      name: p.name, massEarth: +p.massEarth.toFixed(2), orbitRadius: +p.orbitRadius.toFixed(1),
+      angle0: +p.angle0.toFixed(2), radiusPx: +p.radiusPx.toFixed(2), composition: p.composition,
+      moons: p.moons.length,
+    }))
+  );
 
   return { planets };
 }

@@ -47,6 +47,13 @@ class Renderer {
     this.coreMass = null;
     this.initialCoreMass = null;
 
+    // Debug overlay (off by default): draws a labeled bounding box around
+    // every live, on-screen body so it's obvious where the renderer thinks
+    // each one is, even if the actual dot is too small/dim to spot easily.
+    // Toggle with the 'D' key. Temporary debugging aid - safe to remove
+    // once planet visibility is confirmed fixed.
+    this.debugMode = false;
+
     this.particles = []; // ephemeral burst particles: {x,y,vx,vy,born,life,color} in world space
     this._lastFrameTime = null;
     this._lastHoverX = -9999;
@@ -201,9 +208,11 @@ class Renderer {
       return { kind: KIND_NEUTRONSTAR, color: '#cfe8ff', pixelRadius: 1 * this.dpr };
     }
     if (typeCode === PLANET_TYPE_CODE) {
-      // radiusVal is already a display px value (1-3), computed at
-      // generation time - not a world-unit star radius, so no sqrt curve.
-      return { kind: KIND_PLANET, color: '#9a9a9a', pixelRadius: Math.max(1, radiusVal) * this.dpr };
+      // radiusVal is already a display px value (system-bodies.js), not a
+      // world-unit star radius, so no sqrt curve. The 1.8 floor here (not
+      // just at generation time) also covers planets loaded from
+      // localStorage that were saved before that floor was raised.
+      return { kind: KIND_PLANET, color: '#c9ced6', pixelRadius: Math.max(1.8, radiusVal) * this.dpr };
     }
     if (typeCode === SYSTEM_EMPTY_TYPE_CODE) {
       return { kind: KIND_EMPTY, color: 'transparent', pixelRadius: 0 };
@@ -487,9 +496,25 @@ class Renderer {
           ctx.beginPath();
           ctx.arc(sx, sy, r, 0, Math.PI * 2);
           ctx.fill();
+        } else if (k === KIND_PLANET) {
+          // A small soft halo so a 2-4px dot doesn't get lost against the
+          // dark background - most planets are the muted "airless" gray,
+          // which needs the extra help to read as a distinct body rather
+          // than background noise.
+          const r = this.pixelRadius[i];
+          const grad = ctx.createRadialGradient(sx, sy, 0, sx, sy, r * 2.4);
+          grad.addColorStop(0, this.colors[i]);
+          grad.addColorStop(1, 'rgba(0,0,0,0)');
+          ctx.fillStyle = grad;
+          ctx.beginPath();
+          ctx.arc(sx, sy, r * 2.4, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.fillStyle = this.colors[i];
+          ctx.beginPath();
+          ctx.arc(sx, sy, r, 0, Math.PI * 2);
+          ctx.fill();
         } else {
-          // Ordinary star or planet - both are just a plain dot at their
-          // precomputed color/size.
+          // Ordinary star - a plain dot at its precomputed color/size.
           ctx.beginPath();
           ctx.arc(sx, sy, this.pixelRadius ? this.pixelRadius[i] : 1.2 * dpr, 0, Math.PI * 2);
           ctx.fill();
@@ -519,10 +544,34 @@ class Renderer {
             const pos = this._moonWorldPos(px, py, moon, simStep || 0);
             const msx = cx + (pos.x - camera.x) * zoom, msy = cy + (pos.y - camera.y) * zoom;
             ctx.beginPath();
-            ctx.arc(msx, msy, Math.max(0.6, 0.9 * dpr), 0, Math.PI * 2);
+            ctx.arc(msx, msy, Math.max(1.1, 1.4 * dpr), 0, Math.PI * 2);
             ctx.fill();
           }
         }
+      }
+    }
+
+    // Debug overlay: a labeled box around every live body's computed screen
+    // position (green = on-screen, red = clipped/off-screen) - makes it
+    // trivial to see whether a "missing" body is actually just tiny/dim vs.
+    // genuinely mispositioned. Toggle with 'D'. Cheap enough to leave in
+    // (only runs at all when this.debugMode is explicitly turned on).
+    if (this.debugMode && positions) {
+      ctx.font = `${10 * dpr}px monospace`;
+      ctx.textBaseline = 'top';
+      for (let i = 0; i < n; i++) {
+        if (this.alive && !this.alive[i]) continue;
+        if (this.kind && this.kind[i] === KIND_EMPTY) continue;
+        const wx = positions[i * 2], wy = positions[i * 2 + 1];
+        const sx = cx + (wx - camera.x) * zoom, sy = cy + (wy - camera.y) * zoom;
+        const onScreen = sx >= -10 && sx <= w + 10 && sy >= -10 && sy <= h + 10;
+        const boxR = Math.max(6 * dpr, (this.pixelRadius ? this.pixelRadius[i] : 4 * dpr) + 4 * dpr);
+        ctx.strokeStyle = onScreen ? 'rgba(80,255,120,0.9)' : 'rgba(255,80,80,0.9)';
+        ctx.lineWidth = Math.max(1, dpr);
+        ctx.strokeRect(sx - boxR, sy - boxR, boxR * 2, boxR * 2);
+        const label = this.systemMeta[i] ? this.systemMeta[i].name : `#${i}`;
+        ctx.fillStyle = onScreen ? '#8fffb0' : '#ff9a9a';
+        ctx.fillText(`${label} (${sx.toFixed(0)},${sy.toFixed(0)})`, sx + boxR + 2, sy - boxR);
       }
     }
 
