@@ -5,7 +5,9 @@
 // in scope as globals).
 
 /* global STAR_TYPES, CORE_TYPE_CODE, pickStarTypeIndex, BLACKHOLE_TYPE_CODE,
-   BLACKHOLE_SPAWN_CHANCE, BLACKHOLE_MASS */
+   BLACKHOLE_SPAWN_CHANCE, BLACKHOLE_MASS, QUASAR_TYPE_CODE,
+   QUASAR_SPAWN_CHANCE, QUASAR_MASS, NEUTRONSTAR_TYPE_CODE,
+   NEUTRONSTAR_SPAWN_CHANCE, NEUTRONSTAR_MASS_MIN, NEUTRONSTAR_MASS_MAX */
 // Node/CommonJS test-harness path only (browsers/workers get these as
 // globals via importScripts, since star-types.js is loaded first there).
 // This intentionally avoids any top-level var/let/const of its own: in a
@@ -59,11 +61,17 @@ function randn(rand) {
  * generated galaxy isn't perfectly coeval - some stars are already close to
  * the end of their lives, which staggers supernovae naturally once the sim
  * is running instead of producing a single synchronized burst.
- * A small fraction of disk slots (BLACKHOLE_SPAWN_CHANCE) become wandering
- * black holes instead of stars: supermassive point bodies (radius 0, no
+ * A small fraction of disk slots become exotic bodies instead of ordinary
+ * stars, rolled in order of rarity - black hole, then quasar, then neutron
+ * star: black holes and quasars are supermassive point bodies (radius 0, no
  * lifetime) placed the same way as any other disk body but given a near-zero
  * drift velocity instead of an orbital one, so they sit and pull the disk
- * around them rather than orbiting the core themselves.
+ * around them rather than orbiting the core themselves (a quasar is
+ * physically identical to a black hole - same mass, same capture radius -
+ * just a different type code for rendering/info-panel purposes and a much
+ * larger *displayed* mass). A neutron star is an ordinary, gravitationally
+ * unremarkable immortal point mass (a few solar masses) that orbits the
+ * core like any star, just already-dead and never going supernova again.
  *
  * @param {number|string} seed
  * @param {number} numStars total bodies, including the central mass (index 0)
@@ -132,6 +140,37 @@ function generateGalaxy(seed, numStars, opts = {}) {
       continue;
     }
 
+    if (rand() < QUASAR_SPAWN_CHANCE) {
+      // Rarer still, and physically just a black hole with different paint
+      // (see star-types.js: QUASAR_MASS === BLACKHOLE_MASS).
+      type[i] = QUASAR_TYPE_CODE;
+      mass[i] = QUASAR_MASS;
+      radius[i] = 0;
+      lifetime[i] = Infinity;
+      age[i] = 0;
+      vx[i] = (rand() - 0.5) * 4;
+      vy[i] = (rand() - 0.5) * 4;
+      continue;
+    }
+
+    if (rand() < NEUTRONSTAR_SPAWN_CHANCE) {
+      // An already-dead stellar remnant: compact, immortal, gravitationally
+      // ordinary - it orbits the core like any star, just never again ages
+      // toward a supernova.
+      type[i] = NEUTRONSTAR_TYPE_CODE;
+      mass[i] = NEUTRONSTAR_MASS_MIN + rand() * (NEUTRONSTAR_MASS_MAX - NEUTRONSTAR_MASS_MIN);
+      radius[i] = 0.4; // "very small (1px on screen)"
+      lifetime[i] = Infinity;
+      age[i] = 0;
+
+      const enclosedNS = centralMass + diskMassTotal * (r / maxRadius);
+      let vNS = Math.sqrt((G * enclosedNS) / (r + 25));
+      vNS *= 0.92 + rand() * 0.16;
+      vx[i] = -Math.sin(theta) * vNS;
+      vy[i] = Math.cos(theta) * vNS;
+      continue;
+    }
+
     // Spectral type -> base mass/radius/lifetime, each with independent
     // jitter so stars of the same type aren't identical.
     const typeIdx = pickStarTypeIndex(rand);
@@ -161,6 +200,7 @@ function generateGalaxy(seed, numStars, opts = {}) {
 if (typeof self !== 'undefined') {
   self.generateGalaxy = generateGalaxy;
   self.hashSeed = hashSeed;
+  self.mulberry32 = mulberry32; // also needed by system-bodies.js
 }
 if (typeof module !== 'undefined') {
   module.exports = { generateGalaxy, hashSeed, mulberry32 };

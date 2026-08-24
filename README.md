@@ -9,15 +9,21 @@ vanilla JS, no frameworks, no build step.
 - **Procedural spiral galaxy generator** ([src/galaxy.js](src/galaxy.js)), seeded (mulberry32 PRNG) — same seed always produces the same galaxy. A central mass anchors a disk of spectral-typed stars laid out along logarithmic spiral arms, given near-circular initial velocities from an enclosed-mass approximation. Each star also gets a randomized starting age so a fresh galaxy isn't perfectly coeval - deaths stagger naturally instead of arriving in one synchronized burst.
 - **Supernovae**: when a star's age reaches its lifetime, the worker removes it from the simulation (stops integrating/inserting it into the quadtree) and broadcasts a one-off event. The main thread reacts with a gravity-free particle burst (100-200 particles, world-space, fade out over 0.5s), a short 440 Hz Web Audio beep, and a running "Supernovae" counter. Calibrated to ~1-2 events/minute in a 500-star galaxy at 1x speed (dominated by the short-lived O/B stars - realistic, since G/K/M lifetimes run into the billions of years and essentially never complete during a play session).
 - **Black holes** ([src/star-types.js](src/star-types.js), [src/physics-worker.js](src/physics-worker.js)): ~0.3% of disk slots (roughly 1-2 per 500-star galaxy) spawn as a wandering black hole instead of a star - a point mass (radius 0) with near-zero drift velocity that needs no special gravity code, since it's just another (very heavy) body in the same quadtree. Any star that drifts within its capture radius (70 sim units) is removed from the simulation, incrementing that black hole's absorbed-star count. The main thread reacts with a quick white particle flash (10-20 particles, 0.3s) at the black hole. *Calibration note:* the spec's suggested 1e7 solar masses is a real-astronomy figure, but this sim's `G` and distances were already tuned around a much smaller range (stars top out around ~80, the galactic core anchor is ~30000) - plugging 1e7 into that unmodified devoured 498 of 500 stars within 10 seconds in testing, leaving nothing to watch orbit. It's calibrated down to match the core's own mass (30000) instead: still ~400x any star and clearly dominant, but the galaxy survives to be watched. The info panel always shows this same simulated value, never a different display number.
-- **Canvas 2D renderer** ([src/renderer.js](src/renderer.js)) with pan (drag) and zoom (scroll wheel), decoupled from the physics tick rate so rendering stays smooth even if physics lags. Stars render in their spectral-type color at a size derived from their radius; black holes render as a solid dark disc with a semi-transparent purple glow ring at a fixed size (their true radius is ~0). Click a body (a small in-place click, not a drag) to select it.
-- **UI controls** ([src/main.js](src/main.js)): play/pause, speed (0-20x), seed, star count, "new galaxy" (random seed), reset, live FPS / physics-Hz / star-count / black-hole-count / supernova-count / absorbed-count stats, a spectral-type + black-hole color legend, and an info panel for the selected body - type/mass/age/lifetime for a star, or type/mass/event-horizon/stars-absorbed for a black hole (event horizon is a stylized `3 * mass` approximation, not real Schwarzschild physics).
+- **Quasars & neutron stars** ([src/star-types.js](src/star-types.js)): quasars (~1 per 1000 disk slots) are physically identical to a black hole (same mass, same capture-radius absorption - the absorption loop treats both as "absorbers") with a distinct bright yellow/white ring visual and a separate, cosmetic-only "displayed" mass (1e6) shown in the info panel, never fed to gravity. Neutron stars (~0.5% of disk slots) are ordinary, gravitationally unremarkable immortal point masses (2-3 solar masses) - already-dead remnants that orbit the core like any star but never go supernova again.
+- **Sol System zoom** ([src/system-bodies.js](src/system-bodies.js), [src/physics-worker.js](src/physics-worker.js)): click any ordinary star (or the galactic core itself, "Sol") and hit "View System →" to smoothly zoom into its neighborhood. On first visit, 1-5 planets are auto-generated deterministically from a seed derived from the star's index - realistic log-uniform mass distribution (0.3-300 Earth masses), composition/color biased by a stylized equilibrium-temperature estimate, circular orbits computed from this sim's actual `G` and the host's real mass. Planets are genuine N-body physics bodies (reserved capacity slots in the same typed arrays as everything else, populated on demand - `buildTree()`/`step()` need zero changes since dormant slots just use the existing `alive` skip); moons are cosmetic-only orbital animation (see calibration note below for why). Camera and info-panel state persist to `localStorage` per star (keyed by seed+index), so revisiting a star resumes its planets from where they were, re-anchored to the star's current galaxy position.
+  - *Units note:* planet mass is converted Earth-masses → solar-masses via a real physical constant (`EARTH_MASS_IN_SOLAR`), not an empirical fudge - even a 300-Earth-mass giant is <0.1% of the lightest star's mass, so planets never meaningfully perturb their star.
+  - *Stability note:* this galaxy's own stars already pass startlingly close to each other as ordinary N-body behavior (closest-approach distances as low as ~1 unit were measured across a sample of hosts - pre-existing, unrelated to this feature), which tugs on any planet regardless of orbit radius. Orbit radii (20-150 units) were tuned empirically so systems read as stable circles for the timeframe a user actually watches (tight within ~15% at 15s); slower drift over a multi-minute session is real N-body physics, not a bug - the same principle as a wandering black hole "eating" the galaxy over time. Moons were kept out of the physics arrays entirely for the same reason: a stable moon orbit at this scale would sit *inside* the force-softening length, which flattens gravity into near-uselessness there.
+- **Canvas 2D renderer** ([src/renderer.js](src/renderer.js)) with pan (drag) and zoom (scroll wheel), decoupled from the physics tick rate so rendering stays smooth even if physics lags. Stars render in their spectral-type color at a size derived from their radius; black holes are a solid dark disc with a purple glow ring; quasars are a brighter/bigger version of that same ring, in yellow/white; neutron stars are a tiny, extra-bright sparkle. In system view, planets get faint orbit-ring guides and cosmetic moon dots. Click a body (a small in-place click, not a drag) to select it; hover any body for a brief tooltip.
+- **UI controls** ([src/main.js](src/main.js)): play/pause, speed (0-20x), seed, star count, "new galaxy" (random seed), reset, live FPS / physics-Hz / star-count / black-hole-count / supernova-count / absorbed-count stats, a full color legend, a color-coded mode indicator (blue = Galaxy View, green = System View - click it to zoom back out), a "Back to Galaxy" button, and an info panel with type-specific fields plus an action button ("View System →" / "← Back to Galaxy") for every body type: star, core, black hole, quasar, neutron star, planet, and moon.
 
 Tested at 500 stars: ~1.2 ms/physics-step (~0.1 ms/galaxy generation with the
-full stellar + black-hole logic), steady 60 FPS render and ~60 Hz physics at
-1x on the sample hardware, with headroom to spare (scales to well over 1000
-stars before dropping frames). Physics tick rate and step cost are unaffected
-by stellar diversity/aging/black holes - all are cheap O(n) (or O(n * number
-of black holes, which is always 0-2) additions to the existing per-step loops.
+full stellar + black-hole + exotic-body logic), steady 60 FPS render and ~60 Hz
+physics at 1x on the sample hardware, in both galaxy and system view, with
+headroom to spare (scales to well over 1000 stars before dropping frames).
+Physics tick rate and step cost are unaffected by any of the above - stellar
+diversity/aging/absorption/planets are all cheap O(n) (or O(n * a handful of
+absorbers) additions to the existing per-step loops, and a star's reserved
+planet slots cost nothing at all until that star is actually zoomed into.
 
 ## Running it
 
@@ -43,7 +49,10 @@ Then open **http://localhost:8000/** in a browser.
 | Star count | bodies to simulate (central mass + disk stars) |
 | Scroll | zoom |
 | Drag | pan |
-| Click a body | show its info (star: type/mass/age/lifetime; black hole: mass/event horizon/absorbed) |
+| Click a body | show its info panel (fields vary by type) |
+| Hover a body | brief tooltip |
+| "View System →" (info panel, on a star) | zoom smoothly into that star's planets |
+| "← Back to Galaxy" (back button, mode indicator, or info panel on a planet/moon) | zoom back out |
 | Space | toggle play/pause |
 
 To watch a supernova, push the speed slider to 10x+ and wait 20-30s (or
@@ -51,18 +60,31 @@ click New Galaxy a few times - some galaxies roll an O-star close to death
 at spawn and one goes within seconds). Black holes are rarer (~1-2 per
 500-star galaxy) - click New Galaxy until "Black Holes" in the stats reads
 1 or more, then watch the "Absorbed" counter climb as nearby stars fall in.
+Quasars (~0.5 per galaxy) and neutron stars (~2-3 per galaxy) are rarer
+still - keep clicking New Galaxy and watch the stats, or just look for a
+bright yellow ring (quasar) or an extra-bright sparkle (neutron star)
+among the ordinary stars. To see a planetary system, click any ordinary
+star (or the core near the middle of the galaxy - "Sol") and use "View
+System →" in its info panel.
 
 ## File structure
 
 ```
 galaxy-sim/
-├── index.html          # page shell, canvas, UI panel, info panel
-├── style.css            # dark theme, UI/info panel styling
+├── index.html          # page shell, canvas, UI panel, info/mode/tooltip UI
+├── style.css            # dark theme, all panel/overlay/tooltip styling
 └── src/
     ├── quadtree.js       # Barnes-Hut quadtree (force calc)
-    ├── star-types.js      # spectral-type table (O/B/A/F/G/K/M) + black-hole constants: mass, radius, color, lifetime
-    ├── galaxy.js           # seeded procedural galaxy generation (stars + black holes)
-    ├── physics-worker.js    # simulation loop: gravity, aging, supernova + black-hole-capture detection - runs off main thread
-    ├── renderer.js            # canvas drawing, camera/pan/zoom, supernova/absorption particle bursts
-    └── main.js                 # UI wiring, worker messaging, render loop, audio, body selection
+    ├── star-types.js      # every body-type table/constant: spectral types, black hole,
+    │                        quasar, neutron star, planet/moon (single source of truth,
+    │                        shared by the worker via importScripts and the main thread
+    │                        via a <script> tag)
+    ├── galaxy.js           # seeded procedural galaxy generation (stars + all exotic bodies)
+    ├── system-bodies.js     # seeded procedural planet/moon generation for one star (worker-only)
+    ├── physics-worker.js     # simulation loop: gravity, aging, supernova, absorber-capture,
+    │                           and system enter/exit/snapshot - runs off main thread
+    ├── renderer.js             # canvas drawing, camera/pan/zoom + tween, particle bursts,
+    │                             orbit rings/moons, hit-testing for click and hover
+    └── main.js                  # UI wiring, worker messaging, render loop, audio,
+                                    galaxy<->system mode state machine, localStorage persistence
 ```

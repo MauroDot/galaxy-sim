@@ -9,8 +9,14 @@
 <body>
   <canvas id="sim-canvas"></canvas>
 
+  <div id="transition-overlay"></div>
+  <div id="tooltip" class="hidden"></div>
+  <button id="backToGalaxyBtn" class="hidden">← Back to Galaxy</button>
+
   <div id="ui-panel">
     <h1>Galaxy Sim</h1>
+
+    <div id="modeIndicator" class="mode-galaxy">Galaxy View</div>
 
     <div class="row">
       <button id="playPauseBtn">⏸ Pause</button>
@@ -54,9 +60,11 @@
       <span style="color:#ffa347">K</span>
       <span style="color:#ff4d4d">M</span>
       <span style="color:#b078ff" title="Black hole">◎</span>
+      <span style="color:#fff7c2" title="Quasar">✺</span>
+      <span style="color:#cfe8ff" title="Neutron star">✦</span>
     </div>
 
-    <p class="hint">Scroll to zoom · Drag to pan · Space to play/pause · Click a star for info</p>
+    <p class="hint">Scroll to zoom · Drag to pan · Space to play/pause · Click a body for info</p>
   </div>
 
   <div id="info-panel" class="hidden">
@@ -65,7 +73,10 @@
     <div class="info-row"><span id="infoLabel2">Mass</span><span id="infoValue2">-</span></div>
     <div class="info-row"><span id="infoLabel3">Age</span><span id="infoValue3">-</span></div>
     <div class="info-row"><span id="infoLabel4">Lifetime</span><span id="infoValue4">-</span></div>
+    <div class="info-row hidden" id="infoRow5"><span id="infoLabel5">-</span><span id="infoValue5">-</span></div>
+    <div class="info-row hidden" id="infoRow6"><span id="infoLabel6">-</span><span id="infoValue6">-</span></div>
     <div id="infoFlash" class="hidden"></div>
+    <button id="infoAction" class="hidden"></button>
   </div>
 
   <script src="src/star-types.js"></script>

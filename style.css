@@ -188,3 +188,100 @@ input[type="number"]:focus {
 #infoFlash.hidden {
   display: none;
 }
+
+.hidden {
+  display: none !important;
+}
+
+#infoAction {
+  width: 100%;
+  margin-top: 10px;
+  padding: 7px 10px;
+  font-size: 12.5px;
+  border-radius: 8px;
+  border: 1px solid rgba(140, 160, 255, 0.25);
+  background: rgba(90, 110, 220, 0.18);
+  color: #eef0ff;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+#infoAction:hover {
+  background: rgba(110, 130, 240, 0.32);
+}
+
+#modeIndicator {
+  margin: -2px 0 10px;
+  padding: 4px 9px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  display: inline-block;
+}
+#modeIndicator.mode-galaxy {
+  color: #9db3ff;
+  background: rgba(125, 143, 255, 0.14);
+  border: 1px solid rgba(125, 143, 255, 0.3);
+}
+#modeIndicator.mode-system {
+  color: #7be8a8;
+  background: rgba(95, 214, 138, 0.14);
+  border: 1px solid rgba(95, 214, 138, 0.35);
+  cursor: pointer;
+}
+#modeIndicator.mode-system:hover {
+  background: rgba(95, 214, 138, 0.26);
+}
+
+#backToGalaxyBtn {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  z-index: 5;
+  padding: 8px 14px;
+  font-size: 12.5px;
+  font-weight: 600;
+  border-radius: 8px;
+  border: 1px solid rgba(95, 214, 138, 0.35);
+  background: rgba(20, 40, 30, 0.75);
+  color: #7be8a8;
+  cursor: pointer;
+  backdrop-filter: blur(8px);
+  transition: background 0.15s ease;
+}
+#backToGalaxyBtn:hover {
+  background: rgba(95, 214, 138, 0.22);
+}
+
+/* When the back button is showing, push the info panel down so the two
+   fixed top-right elements never overlap. */
+body.system-mode #info-panel {
+  top: 62px;
+}
+
+#transition-overlay {
+  position: fixed;
+  inset: 0;
+  background: #000;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.3s ease;
+  z-index: 20;
+}
+#transition-overlay.active {
+  opacity: 0.28;
+}
+
+#tooltip {
+  position: fixed;
+  z-index: 10;
+  pointer-events: none;
+  padding: 5px 9px;
+  border-radius: 6px;
+  background: rgba(10, 12, 26, 0.92);
+  border: 1px solid rgba(140, 160, 255, 0.25);
+  color: #dfe3ff;
+  font-size: 11.5px;
+  white-space: nowrap;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
+}

@@ -1,7 +1,23 @@
 // renderer.js
 // Canvas 2D rendering: world-space stars -> screen space, with pan/zoom,
-// a soft motion-trail effect, and ephemeral supernova particle bursts.
-// Runs on the main thread.
+// a soft motion-trail effect, ephemeral particle bursts, a galaxy<->system
+// camera tween, and (in system mode) planet orbit rings + cosmetic moons.
+// Runs on the main thread. Domain-agnostic where it can be: it knows how to
+// draw a body given its precomputed color/size/kind, and how to tween the
+// camera toward a target, but main.js decides *when* to do those things.
+
+// Matches physics-worker.js's fixed timestep - needed here only to turn a
+// step count into "simulation seconds" for animating cosmetic moon orbits.
+const RENDER_DT = 1 / 60;
+
+// Body "kind" classification for draw()'s per-body branch, cached per index
+// alongside color/pixelRadius so draw() never has to re-derive it.
+const KIND_STAR = 0;
+const KIND_BLACKHOLE = 1;
+const KIND_QUASAR = 2;
+const KIND_NEUTRONSTAR = 3;
+const KIND_PLANET = 4;
+const KIND_EMPTY = 5;
 
 class Renderer {
   constructor(canvas) {
@@ -11,17 +27,27 @@ class Renderer {
 
     // Camera: world point at screen center + zoom (pixels per world unit).
     this.camera = { x: 0, y: 0, zoom: 0.6 };
+    this.tween = null; // active panZoomTo() animation, if any
 
-    this.colors = null;      // per-star color string, computed once at 'ready'
-    this.pixelRadius = null; // per-star on-screen radius (device px), computed once at 'ready'
-    this.alive = null;       // Uint8Array mirror of worker's alive flags, for skipping dead stars
-    this.isBlackHole = null; // Uint8Array: which indices render as black holes
+    this.colors = null;      // per-index color string, computed at 'ready' / applySlotMeta
+    this.pixelRadius = null; // per-index on-screen radius (device px)
+    this.kind = null;        // per-index KIND_* classification
+    this.starType = null;    // per-index raw type code (for hit-test/info lookups)
+    this.alive = null;       // Uint8Array mirror of worker's alive flags, for skipping dead bodies
 
-    this.particles = []; // supernova burst particles: {x,y,vx,vy,born,color} in world space
+    this.mode = 'galaxy';    // 'galaxy' | 'system' - purely a render-time flag
+    this.focusIndex = -1;    // index of the star being zoomed into, in system mode
+    this.systemMeta = {};    // slot index -> planet metadata (orbitRadius, moons, ...)
+
+    this.particles = []; // ephemeral burst particles: {x,y,vx,vy,born,life,color} in world space
     this._lastFrameTime = null;
+    this._lastHoverX = -9999;
+    this._lastHoverY = -9999;
 
-    // Set by main.js: onClick(cssX, cssY) fires on a genuine click (not a drag-pan).
+    // Set by main.js: onClick/onHover(cssX, cssY) fire on a genuine click
+    // (not a drag-pan) / a throttled hover move, respectively.
     this.onClick = null;
+    this.onHover = null;
 
     this._resize = this._resize.bind(this);
     window.addEventListener('resize', this._resize);
@@ -63,14 +89,23 @@ class Renderer {
       canvas.setPointerCapture(e.pointerId);
     });
     canvas.addEventListener('pointermove', (e) => {
-      if (!dragging) return;
-      const dx = e.clientX - lastX;
-      const dy = e.clientY - lastY;
-      lastX = e.clientX;
-      lastY = e.clientY;
-      moved += Math.abs(dx) + Math.abs(dy);
-      this.camera.x -= dx / this.camera.zoom;
-      this.camera.y -= dy / this.camera.zoom;
+      if (dragging) {
+        const dx = e.clientX - lastX;
+        const dy = e.clientY - lastY;
+        lastX = e.clientX;
+        lastY = e.clientY;
+        moved += Math.abs(dx) + Math.abs(dy);
+        this.camera.x -= dx / this.camera.zoom;
+        this.camera.y -= dy / this.camera.zoom;
+        return;
+      }
+      if (!this.onHover) return;
+      const dx = e.offsetX - this._lastHoverX;
+      const dy = e.offsetY - this._lastHoverY;
+      if (Math.abs(dx) + Math.abs(dy) < 3) return; // throttle
+      this._lastHoverX = e.offsetX;
+      this._lastHoverY = e.offsetY;
+      this.onHover(e.offsetX, e.offsetY);
     });
     canvas.addEventListener('pointerup', (e) => {
       dragging = false;
@@ -78,6 +113,9 @@ class Renderer {
       if (moved < 5 && this.onClick) this.onClick(e.offsetX, e.offsetY);
     });
     canvas.addEventListener('pointercancel', () => { dragging = false; });
+    canvas.addEventListener('pointerleave', () => {
+      if (this.onHover) this.onHover(-1, -1); // hide tooltip
+    });
   }
 
   screenToWorld(sx, sy) {
@@ -103,43 +141,175 @@ class Renderer {
   }
 
   resetCamera() {
+    this.tween = null;
     this.camera.x = 0;
     this.camera.y = 0;
     this.camera.zoom = 0.6;
   }
 
-  // Precompute per-star color (from spectral type) and on-screen radius,
-  // and reset the alive mask. Called once per 'ready' message from the worker.
+  // --- Camera tween (galaxy <-> system transitions) ---
+
+  panZoomTo(targetX, targetY, targetZoom, durationMs, onDone) {
+    const cam = this.camera;
+    this.tween = {
+      fromX: cam.x, fromY: cam.y, fromZoom: cam.zoom,
+      targetX, targetY, targetZoom,
+      start: performance.now(), duration: Math.max(1, durationMs),
+      onDone: onDone || null,
+    };
+  }
+
+  // Called by main.js each frame while a tween is active and the focus body
+  // keeps moving (e.g. a star drifting through the galaxy during the 1s
+  // transition into its system).
+  retarget(x, y) {
+    if (this.tween) { this.tween.targetX = x; this.tween.targetY = y; }
+  }
+
+  _updateTween(now) {
+    if (!this.tween) return;
+    const t = Math.min(1, (now - this.tween.start) / this.tween.duration);
+    const eased = t * t * (3 - 2 * t); // smoothstep
+    this.camera.x = this.tween.fromX + (this.tween.targetX - this.tween.fromX) * eased;
+    this.camera.y = this.tween.fromY + (this.tween.targetY - this.tween.fromY) * eased;
+    this.camera.zoom = this.tween.fromZoom + (this.tween.targetZoom - this.tween.fromZoom) * eased;
+    if (t >= 1) {
+      const done = this.tween.onDone;
+      this.tween = null;
+      if (done) done();
+    }
+  }
+
+  // --- Per-index visual metadata ---
+
+  _visualFor(typeCode, radiusVal) {
+    if (typeCode === BLACKHOLE_TYPE_CODE) {
+      return { kind: KIND_BLACKHOLE, color: '#160821', pixelRadius: 6 * this.dpr };
+    }
+    if (typeCode === QUASAR_TYPE_CODE) {
+      return { kind: KIND_QUASAR, color: '#fff7c2', pixelRadius: 5 * this.dpr };
+    }
+    if (typeCode === NEUTRONSTAR_TYPE_CODE) {
+      return { kind: KIND_NEUTRONSTAR, color: '#cfe8ff', pixelRadius: 1 * this.dpr };
+    }
+    if (typeCode === PLANET_TYPE_CODE) {
+      // radiusVal is already a display px value (1-3), computed at
+      // generation time - not a world-unit star radius, so no sqrt curve.
+      return { kind: KIND_PLANET, color: '#9a9a9a', pixelRadius: Math.max(1, radiusVal) * this.dpr };
+    }
+    if (typeCode === SYSTEM_EMPTY_TYPE_CODE) {
+      return { kind: KIND_EMPTY, color: 'transparent', pixelRadius: 0 };
+    }
+    const st = starTypeByCode(typeCode);
+    return {
+      kind: KIND_STAR,
+      color: st ? st.color : '#ffffff',
+      // Map world-unit radius (1..10) to a small on-screen dot size, with a
+      // sqrt curve so the O/M contrast reads clearly without huge dots.
+      pixelRadius: Math.max(0.9, Math.sqrt(radiusVal) * 0.85) * this.dpr,
+    };
+  }
+
+  // Precompute per-body color/size/kind and reset the alive mask. Called
+  // once per 'ready' message from the worker (n is the full capacity,
+  // including dormant reserved system-body slots).
   setStarMeta(starType, radius, n) {
     const colors = new Array(n);
     const pixelRadius = new Float32Array(n);
-    const isBlackHole = new Uint8Array(n);
+    const kind = new Uint8Array(n);
     colors[0] = 'rgba(255,246,214,1)'; // central mass
     pixelRadius[0] = 0; // drawn specially (glow), see draw()
     for (let i = 1; i < n; i++) {
-      if (starType[i] === BLACKHOLE_TYPE_CODE) {
-        // Fixed on-screen size regardless of mass: the real radius is ~0
-        // (a point mass), so this is purely a legibility choice.
-        isBlackHole[i] = 1;
-        pixelRadius[i] = 6 * this.dpr;
-        colors[i] = '#160821';
-        continue;
-      }
-      const st = starTypeByCode(starType[i]);
-      colors[i] = st ? st.color : '#ffffff';
-      // Map world-unit radius (1..10) to a small on-screen dot size, with a
-      // sqrt curve so the O/M contrast reads clearly without huge dots.
-      pixelRadius[i] = Math.max(0.9, Math.sqrt(radius[i]) * 0.85) * this.dpr;
+      const v = this._visualFor(starType[i], radius[i]);
+      colors[i] = v.color;
+      pixelRadius[i] = v.pixelRadius;
+      kind[i] = v.kind;
     }
     this.colors = colors;
     this.pixelRadius = pixelRadius;
-    this.isBlackHole = isBlackHole;
+    this.kind = kind;
+    this.starType = Uint8Array.from(starType);
     this.alive = new Uint8Array(n).fill(1);
+  }
+
+  // Additive-only update for a handful of indices (e.g. newly populated
+  // system-body slots). Deliberately does NOT touch any other index -
+  // setStarMeta's full alive-array reset would otherwise silently
+  // resurrect every star that already died earlier this session.
+  applySlotMeta(entries) {
+    for (const e of entries) {
+      const v = this._visualFor(e.starType, e.radius);
+      this.colors[e.index] = e.color || v.color;
+      this.pixelRadius[e.index] = v.pixelRadius;
+      this.kind[e.index] = v.kind;
+      this.starType[e.index] = e.starType;
+      this.alive[e.index] = 1;
+    }
   }
 
   markDead(index) {
     if (this.alive) this.alive[index] = 0;
   }
+
+  markSlotsEmpty(indices) {
+    if (!this.alive) return;
+    for (const idx of indices) {
+      this.alive[idx] = 0;
+      if (this.kind) this.kind[idx] = KIND_EMPTY;
+    }
+  }
+
+  setSystemMeta(slots) {
+    this.systemMeta = {};
+    for (const s of slots) this.systemMeta[s.index] = s;
+  }
+
+  clearSystemMeta() {
+    this.systemMeta = {};
+  }
+
+  // --- Hit-testing (shared by click and hover) ---
+
+  findBodyAt(positions, n, sx, sy, thresholdPx = 16) {
+    if (!positions) return -1;
+    let best = -1, bestDist = thresholdPx;
+    for (let i = 0; i < n; i++) {
+      if (this.alive && !this.alive[i]) continue;
+      if (this.kind && this.kind[i] === KIND_EMPTY) continue;
+      const p = this.worldToScreen(positions[i * 2], positions[i * 2 + 1]);
+      const d = Math.hypot(p.x - sx, p.y - sy);
+      if (d < bestDist) { bestDist = d; best = i; }
+    }
+    return best;
+  }
+
+  _moonWorldPos(planetX, planetY, moon, simStep) {
+    const t = simStep * RENDER_DT;
+    const angle = moon.phase0 + moon.angularSpeed * t;
+    return { x: planetX + Math.cos(angle) * moon.orbitRadius, y: planetY + Math.sin(angle) * moon.orbitRadius };
+  }
+
+  // Moons have no physics-array index (they're pure render-time decoration -
+  // see system-bodies.js), so they need their own hit-test path.
+  findMoonAt(positions, sx, sy, simStep, thresholdPx = 10) {
+    let best = null, bestDist = thresholdPx;
+    for (const key in this.systemMeta) {
+      const idx = Number(key);
+      if (this.alive && !this.alive[idx]) continue;
+      const meta = this.systemMeta[idx];
+      if (!meta.moons || !meta.moons.length) continue;
+      const px = positions[idx * 2], py = positions[idx * 2 + 1];
+      for (let m = 0; m < meta.moons.length; m++) {
+        const pos = this._moonWorldPos(px, py, meta.moons[m], simStep);
+        const p = this.worldToScreen(pos.x, pos.y);
+        const d = Math.hypot(p.x - sx, p.y - sy);
+        if (d < bestDist) { bestDist = d; best = { planetIndex: idx, moonIndex: m }; }
+      }
+    }
+    return best;
+  }
+
+  // --- Particles (supernova bursts, absorption flashes) ---
 
   // Spawn a burst of ephemeral, gravity-free particles at a world position.
   // opts: { countMin, countMax, life (seconds), speedMin, speedMax }
@@ -199,10 +369,13 @@ class Renderer {
     ctx.globalAlpha = 1;
   }
 
-  draw(positions, n, now) {
+  // --- Main draw ---
+
+  draw(positions, n, now, simStep) {
     now = now ?? performance.now();
     const dtSec = this._lastFrameTime == null ? 0 : Math.min(0.05, (now - this._lastFrameTime) / 1000);
     this._lastFrameTime = now;
+    this._updateTween(now);
 
     const { ctx, canvas, camera, dpr } = this;
     const w = canvas.width, h = canvas.height;
@@ -222,7 +395,9 @@ class Renderer {
         const sy = cy + (wy - camera.y) * zoom;
         if (sx < -10 || sx > w + 10 || sy < -10 || sy > h + 10) continue;
 
+        const k = this.kind ? this.kind[i] : KIND_STAR;
         ctx.fillStyle = this.colors[i] || 'rgba(220,220,255,0.9)';
+
         if (i === 0) {
           const r = Math.max(3, 4 * dpr);
           const grad = ctx.createRadialGradient(sx, sy, 0, sx, sy, r * 6);
@@ -236,7 +411,7 @@ class Renderer {
           ctx.beginPath();
           ctx.arc(sx, sy, r, 0, Math.PI * 2);
           ctx.fill();
-        } else if (this.isBlackHole && this.isBlackHole[i]) {
+        } else if (k === KIND_BLACKHOLE) {
           const r = this.pixelRadius[i];
           // Subtle glowing ring first (lighter purple, semi-transparent, 1.5x radius)...
           ctx.strokeStyle = 'rgba(176,120,255,0.55)';
@@ -249,10 +424,76 @@ class Renderer {
           ctx.beginPath();
           ctx.arc(sx, sy, r, 0, Math.PI * 2);
           ctx.fill();
+        } else if (k === KIND_QUASAR) {
+          const r = this.pixelRadius[i];
+          // Big soft outer glow - "very distinctive, looks like a tiny star with a big ring".
+          const grad = ctx.createRadialGradient(sx, sy, 0, sx, sy, r * 5);
+          grad.addColorStop(0, 'rgba(255,247,194,0.55)');
+          grad.addColorStop(1, 'rgba(255,247,194,0)');
+          ctx.fillStyle = grad;
+          ctx.beginPath();
+          ctx.arc(sx, sy, r * 5, 0, Math.PI * 2);
+          ctx.fill();
+          // Bright yellow/white ring.
+          ctx.strokeStyle = 'rgba(255,244,180,0.9)';
+          ctx.lineWidth = Math.max(1.2, 1.6 * dpr);
+          ctx.beginPath();
+          ctx.arc(sx, sy, r * 2, 0, Math.PI * 2);
+          ctx.stroke();
+          // Bright core.
+          ctx.fillStyle = '#fffdf0';
+          ctx.beginPath();
+          ctx.arc(sx, sy, r, 0, Math.PI * 2);
+          ctx.fill();
+        } else if (k === KIND_NEUTRONSTAR) {
+          const r = Math.max(1, this.pixelRadius[i]);
+          // Tiny but brighter-than-a-star sparkle.
+          const grad = ctx.createRadialGradient(sx, sy, 0, sx, sy, r * 3);
+          grad.addColorStop(0, 'rgba(207,232,255,0.9)');
+          grad.addColorStop(1, 'rgba(207,232,255,0)');
+          ctx.fillStyle = grad;
+          ctx.beginPath();
+          ctx.arc(sx, sy, r * 3, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.fillStyle = '#ffffff';
+          ctx.beginPath();
+          ctx.arc(sx, sy, r, 0, Math.PI * 2);
+          ctx.fill();
         } else {
+          // Ordinary star or planet - both are just a plain dot at their
+          // precomputed color/size.
           ctx.beginPath();
           ctx.arc(sx, sy, this.pixelRadius ? this.pixelRadius[i] : 1.2 * dpr, 0, Math.PI * 2);
           ctx.fill();
+        }
+      }
+    }
+
+    // System-mode extras: faint orbit rings + cosmetic moons.
+    if (this.mode === 'system' && positions && this.focusIndex >= 0 && this.focusIndex < n) {
+      const hx = positions[this.focusIndex * 2], hy = positions[this.focusIndex * 2 + 1];
+      const hsx = cx + (hx - camera.x) * zoom, hsy = cy + (hy - camera.y) * zoom;
+      ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+      ctx.lineWidth = Math.max(1, dpr);
+      for (const key in this.systemMeta) {
+        const idx = Number(key);
+        if (this.alive && !this.alive[idx]) continue;
+        const meta = this.systemMeta[idx];
+        const ringR = meta.orbitRadius * zoom;
+        ctx.beginPath();
+        ctx.arc(hsx, hsy, ringR, 0, Math.PI * 2);
+        ctx.stroke();
+
+        if (meta.moons && meta.moons.length) {
+          const px = positions[idx * 2], py = positions[idx * 2 + 1];
+          ctx.fillStyle = 'rgba(220,225,255,0.85)';
+          for (const moon of meta.moons) {
+            const pos = this._moonWorldPos(px, py, moon, simStep || 0);
+            const msx = cx + (pos.x - camera.x) * zoom, msy = cy + (pos.y - camera.y) * zoom;
+            ctx.beginPath();
+            ctx.arc(msx, msy, Math.max(0.6, 0.9 * dpr), 0, Math.PI * 2);
+            ctx.fill();
+          }
         }
       }
     }
