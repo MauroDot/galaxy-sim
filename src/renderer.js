@@ -49,6 +49,17 @@ class Renderer {
     this.selectedGalaxyId = -1;
     this._cosmicTrails = new Map(); // galaxyId -> [{x,y}, ...] ring buffer of recent positions
 
+    // System-mode orbit trail: a short per-planet position history, drawn
+    // as a fading polyline in system view. A DISTINCT mechanism from both
+    // _cosmicTrails above and the global soft-fade fillRect in draw()'s
+    // main loop - that fade is imperceptible at real orbital speeds (a
+    // full period can take tens of minutes to hours at this sim's
+    // calibrated scale, confirmed empirically), so a planet's circularity
+    // needs its own, longer-lived trail to be visible without literally
+    // waiting out a full orbit. Keyed by slot index, not id, matching how
+    // every other system-body lookup in this file already works.
+    this._systemTrails = new Map(); // slot index -> [{x,y}, ...] ring buffer
+
     this.selectedIndex = -1; // currently-selected body (set by main.js) - drawn with a selection ring
     this._newFlashes = [];   // [{index, born, duration}] - new-body glow fade, reads live position
     this._deleteFades = [];  // [{x,y,color,pixelRadius,born,duration}] - VALUE-snapshotted, not live:
@@ -311,11 +322,19 @@ class Renderer {
 
   setSystemMeta(slots) {
     this.systemMeta = {};
-    for (const s of slots) this.systemMeta[s.index] = s;
+    const stillTracked = new Set();
+    for (const s of slots) { this.systemMeta[s.index] = s; stillTracked.add(s.index); }
+    // Prune trail history for any slot that's no longer present (deleted,
+    // collided, absorbed) - same "drop what's no longer tracked" pattern
+    // _cosmicTrails already uses in updateCosmicTrails-adjacent code.
+    for (const idx of this._systemTrails.keys()) {
+      if (!stillTracked.has(idx)) this._systemTrails.delete(idx);
+    }
   }
 
   clearSystemMeta() {
     this.systemMeta = {};
+    this._systemTrails.clear();
   }
 
   // Cosmic mode's equivalent of setStarMeta/setSystemMeta - `galaxies` is
@@ -697,26 +716,58 @@ class Renderer {
       }
     }
 
-    // System-mode extras: faint orbit rings + cosmetic moons.
+    // System-mode extras: faint nominal-orbit rings, per-planet orbit
+    // trails, + cosmetic moons.
+    const SYSTEM_TRAIL_LENGTH = 240; // ~4s of samples at 60Hz - enough to read curvature without a full orbit
     if (this.mode === 'system' && positions && this.focusIndex >= 0 && this.focusIndex < n) {
       const hx = positions[this.focusIndex * 2], hy = positions[this.focusIndex * 2 + 1];
       const hsx = cx + (hx - camera.x) * zoom, hsy = cy + (hy - camera.y) * zoom;
-      ctx.strokeStyle = 'rgba(255,255,255,0.12)';
-      ctx.lineWidth = Math.max(1, dpr);
       for (const key in this.systemMeta) {
         const idx = Number(key);
         if (this.alive && !this.alive[idx]) continue;
         const meta = this.systemMeta[idx];
+
+        // Nominal orbit ring: plain faint white for pure-physics bodies,
+        // a soft cyan tint for anything the Orbit Stability slider/"Lock
+        // Orbit" is actively assisting - a quick "this one's protected"
+        // visual cue with zero extra state (meta.lockStrength already
+        // travels with every systemBodyDelta/starInfo broadcast).
+        const assisted = meta.locked && (meta.lockStrength || 0) > 0;
+        ctx.strokeStyle = assisted ? 'rgba(130,220,255,0.28)' : 'rgba(255,255,255,0.12)';
+        ctx.lineWidth = Math.max(1, dpr);
         const ringR = meta.orbitRadius * zoom;
         ctx.beginPath();
         ctx.arc(hsx, hsy, ringR, 0, Math.PI * 2);
         ctx.stroke();
 
+        // Orbit trail: append the current position (world space, sampled
+        // once per rendered frame - fine-grained enough at 60fps to read
+        // as smooth curvature over a few seconds).
+        const wx = positions[idx * 2], wy = positions[idx * 2 + 1];
+        let trail = this._systemTrails.get(idx);
+        if (!trail) { trail = []; this._systemTrails.set(idx, trail); }
+        if (trail.length === 0 || trail[trail.length - 1].x !== wx || trail[trail.length - 1].y !== wy) {
+          trail.push({ x: wx, y: wy });
+          if (trail.length > SYSTEM_TRAIL_LENGTH) trail.shift();
+        }
+        if (trail.length > 1) {
+          ctx.beginPath();
+          for (let t = 0; t < trail.length; t++) {
+            const p = trail[t];
+            const tsx = cx + (p.x - camera.x) * zoom, tsy = cy + (p.y - camera.y) * zoom;
+            if (t === 0) ctx.moveTo(tsx, tsy); else ctx.lineTo(tsx, tsy);
+          }
+          ctx.strokeStyle = this.colors && this.colors[idx] ? this.colors[idx] : 'rgba(220,225,255,0.5)';
+          ctx.globalAlpha = 0.35;
+          ctx.lineWidth = Math.max(1, 1.1 * dpr);
+          ctx.stroke();
+          ctx.globalAlpha = 1;
+        }
+
         if (meta.moons && meta.moons.length) {
-          const px = positions[idx * 2], py = positions[idx * 2 + 1];
           ctx.fillStyle = 'rgba(220,225,255,0.85)';
           for (const moon of meta.moons) {
-            const pos = this._moonWorldPos(px, py, moon, simStep || 0);
+            const pos = this._moonWorldPos(wx, wy, moon, simStep || 0);
             const msx = cx + (pos.x - camera.x) * zoom, msy = cy + (pos.y - camera.y) * zoom;
             ctx.beginPath();
             ctx.arc(msx, msy, Math.max(1.1, 1.4 * dpr), 0, Math.PI * 2);
@@ -803,6 +854,43 @@ class Renderer {
         const label = this.systemMeta[i] ? this.systemMeta[i].name : `#${i}`;
         ctx.fillStyle = onScreen ? '#8fffb0' : '#ff9a9a';
         ctx.fillText(`${label} (${sx.toFixed(0)},${sy.toFixed(0)})`, sx + boxR + 2, sy - boxR);
+
+        // System-mode extra: a velocity-direction arrow (from the orbit
+        // trail's last two samples - no extra worker message needed, the
+        // trail already has what's needed) and live distance-from-host
+        // text, directly under the existing box label.
+        if (this.mode === 'system' && this.systemMeta[i] && onScreen) {
+          const dist = this.focusIndex >= 0
+            ? Math.hypot(wx - positions[this.focusIndex * 2], wy - positions[this.focusIndex * 2 + 1])
+            : null;
+          if (dist != null) {
+            ctx.fillText(`dist=${dist.toFixed(1)}`, sx + boxR + 2, sy - boxR + 11 * dpr);
+          }
+          const trail = this._systemTrails.get(i);
+          if (trail && trail.length >= 2) {
+            const a = trail[trail.length - 2], b = trail[trail.length - 1];
+            const dx = b.x - a.x, dy = b.y - a.y;
+            const mag = Math.hypot(dx, dy);
+            if (mag > 1e-6) {
+              const arrowLen = 18 * dpr;
+              const ex = sx + (dx / mag) * arrowLen, ey = sy + (dy / mag) * arrowLen;
+              ctx.strokeStyle = 'rgba(255,220,120,0.9)';
+              ctx.lineWidth = Math.max(1, 1.2 * dpr);
+              ctx.beginPath();
+              ctx.moveTo(sx, sy);
+              ctx.lineTo(ex, ey);
+              ctx.stroke();
+              const ang = Math.atan2(ey - sy, ex - sx);
+              ctx.beginPath();
+              ctx.moveTo(ex, ey);
+              ctx.lineTo(ex - 5 * dpr * Math.cos(ang - 0.4), ey - 5 * dpr * Math.sin(ang - 0.4));
+              ctx.lineTo(ex - 5 * dpr * Math.cos(ang + 0.4), ey - 5 * dpr * Math.sin(ang + 0.4));
+              ctx.closePath();
+              ctx.fillStyle = 'rgba(255,220,120,0.9)';
+              ctx.fill();
+            }
+          }
+        }
       }
     }
 

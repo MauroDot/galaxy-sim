@@ -75,6 +75,17 @@ function isAbsorber(typeCode) {
   return typeCode === BLACKHOLE_TYPE_CODE || typeCode === QUASAR_TYPE_CODE;
 }
 
+// True only for a FULL Orbit Stability lock (strength===1, or an
+// old/undefined lock predating the `strength` field, which always meant
+// full lock) - see step()'s locked-orbit block. A partial lock
+// (0<strength<1) must NOT be treated as fully locked here: it needs real
+// gravity applied like any other body, then gets nudged toward its ideal
+// circle afterward instead of having its motion overridden outright.
+function isFullyLocked(s, i) {
+  const lock = s.lockedOrbit[i];
+  return !!lock && (lock.strength ?? 1) >= 1;
+}
+
 let state = null;        // typed-array-backed; see initSim for full shape
 let seed = 1;
 let numStars = 500;
@@ -84,6 +95,7 @@ let speed = 1;
 let acc = 0;
 let timer = null;
 let stepCount = 0;
+let lastProximityWarningIndex = -1; // -1 = no warning currently active; see tick()'s proximity check
 
 // Cosmic Web Sandbox: a second, much lighter simulation layer alongside
 // `state` above, not instead of it - see cosmic-web.js's header comment for
@@ -131,11 +143,15 @@ function step(s) {
   // Kick: apply accelerations from the tree built at the current positions
   // (symplectic/semi-implicit Euler - stable and cheap for a real-time viz).
   // Pinned bodies (the core, a shared-system's synthetic host) and
-  // locked-orbit bodies are skipped here - they still exert gravity on
-  // everyone else (they're still in the tree above), they just don't
-  // accelerate from it.
+  // FULLY locked-orbit bodies (strength===1, "Orbit Stability" at 100%) are
+  // skipped here - they still exert gravity on everyone else (they're still
+  // in the tree above), they just don't accelerate from it. A PARTIALLY
+  // locked body (0<strength<1) is deliberately NOT skipped - it accumulates
+  // real gravity exactly like every other body, then gets nudged toward its
+  // ideal circle below. This is what keeps "one shared force-calc path for
+  // every body" true even for stability-assisted planets.
   for (let i = 0; i < n; i++) {
-    if (!s.alive[i] || s.pinned[i] || s.lockedOrbit[i]) continue;
+    if (!s.alive[i] || s.pinned[i] || isFullyLocked(s, i)) continue;
     const body = { x: s.x[i], y: s.y[i], mass: s.mass[i] };
     const f = tree.calculateForce(body, G);
     const invM = 1 / s.mass[i];
@@ -144,22 +160,31 @@ function step(s) {
   }
   // Drift. Pinned bodies never accelerate so their velocity stays at
   // whatever it was initialized to (0) - this naturally leaves them
-  // motionless without needing to also skip them here. Locked-orbit bodies
-  // ARE skipped here too (their position is set kinematically below instead).
+  // motionless without needing to also skip them here. Only FULLY
+  // locked-orbit bodies are skipped here too (their position is set
+  // kinematically below instead); partially-locked bodies drift normally
+  // on their real (just-kicked) velocity, same as an unlocked body.
   for (let i = 0; i < n; i++) {
-    if (!s.alive[i] || s.lockedOrbit[i]) continue;
+    if (!s.alive[i] || isFullyLocked(s, i)) continue;
     s.x[i] += s.vx[i] * DT;
     s.y[i] += s.vy[i] * DT;
   }
 
-  // Locked-orbit kinematic override: position/velocity recomputed directly
-  // from stored orbital parameters (same formula moons already use, applied
-  // here to a REAL body) rather than integrated - "Lock Orbit" freezes a
-  // body into a circular path even if its mass later changes. Elapsed time
-  // is measured from `lockedAtStep` (when this lock was established), NOT
-  // from simulation start - using stepCount directly here made the body
-  // snap to an arbitrary angle the instant it locked (see lockOrbit()'s
-  // comment in system-editor.js for the full story of that bug).
+  // Locked-orbit kinematic override/blend: ideal position/velocity recomputed
+  // directly from stored orbital parameters (same formula moons already use,
+  // applied here to a REAL body) rather than integrated - "Lock Orbit"
+  // freezes a body into a circular path even if its mass later changes.
+  // Elapsed time is measured from `lockedAtStep` (when this lock was
+  // established), NOT from simulation start - using stepCount directly here
+  // made the body snap to an arbitrary angle the instant it locked (see
+  // lockOrbit()'s comment in system-editor.js for the full story of that
+  // bug). At strength===1 ("Orbit Stability" 100%) this is the exact hard
+  // override it always was. At 0<strength<1, the body already accumulated
+  // real gravity and drifted normally above (it was NOT skipped in the
+  // kick/drift loops) - this instead nudges its actual position/velocity a
+  // fraction of the way toward the ideal circle EVERY tick, a smooth
+  // continuous blend rather than a periodic snap-if-drifted-too-far
+  // correction, so it never produces a visible jump.
   for (const idxStr in s.lockedOrbit) {
     const idx = Number(idxStr);
     if (!s.alive[idx]) { delete s.lockedOrbit[idx]; continue; }
@@ -167,11 +192,21 @@ function step(s) {
     const hostIdx = lock.hostIndex;
     const t = (stepCount - (lock.lockedAtStep || 0)) * DT;
     const angle = lock.phase0 + lock.angularSpeed * t;
-    s.x[idx] = s.x[hostIdx] + Math.cos(angle) * lock.radius;
-    s.y[idx] = s.y[hostIdx] + Math.sin(angle) * lock.radius;
+    const idealX = s.x[hostIdx] + Math.cos(angle) * lock.radius;
+    const idealY = s.y[hostIdx] + Math.sin(angle) * lock.radius;
     const v = lock.radius * lock.angularSpeed;
-    s.vx[idx] = s.vx[hostIdx] - Math.sin(angle) * v;
-    s.vy[idx] = s.vy[hostIdx] + Math.cos(angle) * v;
+    const idealVX = s.vx[hostIdx] - Math.sin(angle) * v;
+    const idealVY = s.vy[hostIdx] + Math.cos(angle) * v;
+    const strength = lock.strength ?? 1;
+    if (strength >= 1) {
+      s.x[idx] = idealX; s.y[idx] = idealY;
+      s.vx[idx] = idealVX; s.vy[idx] = idealVY;
+    } else {
+      s.x[idx] += (idealX - s.x[idx]) * strength;
+      s.y[idx] += (idealY - s.y[idx]) * strength;
+      s.vx[idx] += (idealVX - s.vx[idx]) * strength;
+      s.vy[idx] += (idealVY - s.vy[idx]) * strength;
+    }
   }
 
   // Core consumption: the core (index 0) is itself a supermassive black
@@ -333,9 +368,11 @@ function initSim(newSeed, newNumStars, newParams) {
     undoStack: [],
     nextCustomIndex: 1,
     nextMoonId: 1,
+    orbitStabilityDefault: 0,
   };
   acc = 0;
   stepCount = 0;
+  lastProximityWarningIndex = -1;
   emit({
     type: 'ready',
     n: state.n,
@@ -537,6 +574,27 @@ function tick() {
     if (state) postPositions();
     if (cosmicState) postCosmicPositions();
   }
+  // Proximity warning (Finding 2 UX fix): while a system is loaded, once
+  // per tick, check whether a wandering absorber has come close enough to
+  // plausibly explain instability the user is about to see. O(numAbsorbers)
+  // - "a handful at most" per the absorber-capture comment above - so this
+  // is effectively free. Only emits when the warning STATE changes (goes
+  // active, changes which absorber, or clears), not every tick, to avoid
+  // spamming the main thread with an unchanging value 60x/sec.
+  if (stepped && state && state.focusIndex !== -1) {
+    const warning = absorberProximityWarning(state, state.absorberIndices, state.focusIndex);
+    const warnIndex = warning ? warning.index : -1;
+    if (warnIndex !== lastProximityWarningIndex) {
+      lastProximityWarningIndex = warnIndex;
+      emit({
+        type: 'proximityWarning',
+        active: !!warning,
+        absorberIndex: warning ? warning.index : null,
+        distance: warning ? warning.distance : null,
+        mass: warning ? warning.mass : null,
+      });
+    }
+  }
   for (const i of allDied) {
     emit({
       type: 'supernova',
@@ -600,6 +658,8 @@ function evictSystem() {
   if (!state || state.focusIndex === -1) return;
   clearSystemBodies(state);
   state.focusIndex = -1;
+  state.orbitStabilityDefault = 0;
+  lastProximityWarningIndex = -1; // don't leak a stale warning into whatever's entered next
 }
 
 // Persisted-save shape: {starIndex, genSignature, hostType, hostMass,
@@ -658,6 +718,8 @@ function enterSystem(starIndex, saved) {
   state.undoStack = [];
   state.nextCustomIndex = 1;
   state.nextMoonId = 1;
+  state.orbitStabilityDefault = 0; // opt-in per system, never carried over from whatever was loaded before
+  lastProximityWarningIndex = -1;
 
   let wasGenerated;
   if (saved && saved.genSignature === genSignature && saved.hostType === hostType &&
@@ -731,6 +793,8 @@ function loadSharedSystem(payload) {
   state.undoStack = [];
   state.nextCustomIndex = 1;
   state.nextMoonId = 1;
+  state.orbitStabilityDefault = 0;
+  lastProximityWarningIndex = -1;
 
   const bodies = (payload.bodies || []).map((b) => {
     const { vx, vy } = circularOrbitVelocity(G, payload.hostMass, 0, 0, b.orbitRadius, b.angle0, b.speedMult);
@@ -775,11 +839,34 @@ function sendStarInfo(index) {
   };
   if (typeCode === PLANET_TYPE_CODE && state.systemMeta[index]) {
     const meta = state.systemMeta[index];
-    const hostVX = state.vx[meta.hostIndex], hostVY = state.vy[meta.hostIndex];
-    const dx = state.x[index] - state.x[meta.hostIndex], dy = state.y[index] - state.y[meta.hostIndex];
+    const hostIdx = meta.hostIndex;
+    const hostMass = state.mass[hostIdx];
+    const hostVX = state.vx[hostIdx], hostVY = state.vy[hostIdx];
+    const dx = state.x[index] - state.x[hostIdx], dy = state.y[index] - state.y[hostIdx];
+    const vxRel = state.vx[index] - hostVX, vyRel = state.vy[index] - hostVY;
     const currentRadius = Math.hypot(dx, dy);
-    const orbitalSpeed = Math.hypot(state.vx[index] - hostVX, state.vy[index] - hostVY);
+    const orbitalSpeed = Math.hypot(vxRel, vyRel);
     const periodSeconds = orbitalSpeed > 0 ? (2 * Math.PI * currentRadius) / orbitalSpeed : Infinity;
+
+    // Δv from circular, and eccentricity - both purely DISPLAY numbers
+    // derived from the body's current, already-correct state (nothing here
+    // feeds back into the physics). circularSpeed is the same formula
+    // circularOrbitVelocity() uses internally, evaluated at the body's
+    // CURRENT radius (not its original orbitRadius) so it reads "how far
+    // from a circular orbit at this exact instant", matching what the
+    // debug overlay's velocity vector shows. Eccentricity via the standard
+    // specific-angular-momentum/specific-energy identity
+    // (e = sqrt(1 + 2*epsilon*h^2/mu^2)) - falls out to ~0 for the
+    // near-circular case already verified empirically during diagnosis.
+    const mu = G * hostMass;
+    const circularSpeed = currentRadius > 0 ? Math.sqrt(mu / currentRadius) : 0;
+    const deltaVFromCircularPct = circularSpeed > 0
+      ? ((orbitalSpeed - circularSpeed) / circularSpeed) * 100 : 0;
+    const h = dx * vyRel - dy * vxRel; // specific angular momentum (2D cross product)
+    const specificEnergy = (orbitalSpeed * orbitalSpeed) / 2 - mu / currentRadius;
+    const eccentricity = mu > 0
+      ? Math.sqrt(Math.max(0, 1 + (2 * specificEnergy * h * h) / (mu * mu))) : 0;
+
     Object.assign(payload, {
       isPlanet: true,
       kind: meta.kind,
@@ -789,11 +876,15 @@ function sendStarInfo(index) {
       currentRadius,
       tempK: meta.tempK,
       composition: meta.composition,
-      hostIndex: meta.hostIndex,
+      hostIndex: hostIdx,
       orbitalSpeed,
+      circularSpeed,
+      deltaVFromCircularPct,
+      eccentricity,
       periodYears: periodSeconds * ORBIT_PERIOD_YEAR_SCALE,
       moons: meta.moons,
       locked: !!meta.locked,
+      lockStrength: meta.lockStrength || 0,
       stability: stabilityFor(currentRadius, meta.orbitRadius),
     });
   }
@@ -921,6 +1012,15 @@ function handleMessage(msg) {
       if (state.focusIndex === -1) break;
       pushUndoSnapshot(state);
       const result = createPlanet(state, G, msg.x, msg.y);
+      // Orbit Stability slider default: only ever applied to bodies the
+      // user interactively creates AFTER setting it (see
+      // 'setOrbitStabilityDefault' below) - the system's own
+      // auto-generated planets are placed at enterSystem() time, before
+      // there's been any chance to touch this system's slider, so they're
+      // deliberately left alone.
+      if (result && !result.poolFull && state.orbitStabilityDefault > 0) {
+        lockOrbit(state, G, result.index, stepCount, state.orbitStabilityDefault);
+      }
       broadcastSystemDelta('createPlanet', result);
       break;
     }
@@ -962,18 +1062,39 @@ function handleMessage(msg) {
     case 'lockOrbit': {
       if (state.focusIndex === -1) break;
       pushUndoSnapshot(state);
-      const result = msg.locked ? lockOrbit(state, G, msg.index, stepCount) : unlockOrbit(state, msg.index);
+      // `msg.strength` (0-1) is the new, general "Orbit Stability" form;
+      // `msg.locked` (boolean) is the original right-click toggle and
+      // still works unchanged (true -> full lock, false -> unlock).
+      const strength = typeof msg.strength === 'number' ? msg.strength : (msg.locked ? 1 : 0);
+      const result = strength > 0
+        ? lockOrbit(state, G, msg.index, stepCount, strength)
+        : unlockOrbit(state, msg.index);
       broadcastSystemDelta('lockOrbit', result);
+      break;
+    }
+    case 'setOrbitStabilityDefault': {
+      if (!state || state.focusIndex === -1) break;
+      state.orbitStabilityDefault = Math.min(1, Math.max(0, msg.strength ?? 0));
+      emit({ type: 'orbitStabilityDefault', strength: state.orbitStabilityDefault });
       break;
     }
     case 'addAsteroidField': {
       if (state.focusIndex === -1) break;
       pushUndoSnapshot(state);
       const result = addAsteroidField(state, G);
+      if (state.orbitStabilityDefault > 0) {
+        for (const b of result) lockOrbit(state, G, b.index, stepCount, state.orbitStabilityDefault);
+      }
       broadcastSystemDelta('addAsteroidField', result);
       break;
     }
     case 'addComet': {
+      // Comets are deliberately given LESS than circular speed so real
+      // gravity turns them into a genuinely eccentric ellipse - see
+      // addComet()'s own comment in system-editor.js. The Orbit Stability
+      // default is intentionally NOT applied here: locking a comet would
+      // force it into a circle and erase the one body kind that's
+      // *supposed* to look eccentric.
       if (state.focusIndex === -1) break;
       pushUndoSnapshot(state);
       const result = addComet(state, G);

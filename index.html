@@ -27,12 +27,22 @@
       <button id="addCometBtn" title="Launch a comet on an eccentric, fast-moving path">☄ Add Comet</button>
       <button id="addMoonBtn" title="Click, then click a planet to give it a moon">🌙 Add Moon</button>
       <button id="saveSystemBtn" title="Generate a shareable link that reproduces this system">🔗 Save System</button>
+      <label id="orbitStabilityControl" title="Blends newly-created bodies toward a perfect circle. 0% = pure physics (default). Existing bodies are unaffected - use Lock Orbit on a selected body instead.">
+        Realism
+        <input type="range" id="orbitStabilitySlider" min="0" max="100" value="0" step="5" />
+        Stability
+        <span id="orbitStabilityValue">0%</span>
+      </label>
     </div>
 
     <div id="statusLine">
       Bodies: <span id="statusBodies">-</span>
       · Stability: <span id="statusStability">-</span>
       <button id="undoBtn" title="Undo the last action (Ctrl+Z)">↶ Undo</button>
+    </div>
+
+    <div id="proximityWarning" class="hidden" title="A massive wandering body is passing close to this system - real N-body gravity, not a bug. Nearby orbits may drift or bodies may be captured.">
+      ⚠ A massive object is passing nearby - orbits here may be disrupted
     </div>
 
     <div id="creationStatus" class="hidden"></div>
@@ -147,6 +157,7 @@
     <div class="info-row"><span id="infoLabel4">Lifetime</span><span id="infoValue4">-</span></div>
     <div class="info-row hidden" id="infoRow5"><span id="infoLabel5">-</span><span id="infoValue5">-</span></div>
     <div class="info-row hidden" id="infoRow6"><span id="infoLabel6">-</span><span id="infoValue6">-</span></div>
+    <div class="info-row hidden" id="infoRow7"><span id="infoLabel7">-</span><span id="infoValue7">-</span></div>
     <div id="infoFlash" class="hidden"></div>
     <button id="infoAction" class="hidden"></button>
 

@@ -51,6 +51,9 @@
     infoRow6: document.getElementById('infoRow6'),
     infoLabel6: document.getElementById('infoLabel6'),
     infoValue6: document.getElementById('infoValue6'),
+    infoRow7: document.getElementById('infoRow7'),
+    infoLabel7: document.getElementById('infoLabel7'),
+    infoValue7: document.getElementById('infoValue7'),
     infoAction: document.getElementById('infoAction'),
     infoFlash: document.getElementById('infoFlash'),
     editRow: document.getElementById('infoEditRow'),
@@ -68,11 +71,14 @@
     addCometBtn: document.getElementById('addCometBtn'),
     addMoonBtn: document.getElementById('addMoonBtn'),
     saveSystemBtn: document.getElementById('saveSystemBtn'),
+    orbitStabilitySlider: document.getElementById('orbitStabilitySlider'),
+    orbitStabilityValue: document.getElementById('orbitStabilityValue'),
     undoBtn: document.getElementById('undoBtn'),
     statusLine: document.getElementById('statusLine'),
     statusBodies: document.getElementById('statusBodies'),
     statusStability: document.getElementById('statusStability'),
     creationStatus: document.getElementById('creationStatus'),
+    proximityWarning: document.getElementById('proximityWarning'),
 
     contextMenu: document.getElementById('contextMenu'),
     ctxIncreaseMass: document.getElementById('ctxIncreaseMass'),
@@ -350,6 +356,7 @@
     renderer.mode = 'galaxy';
     renderer.focusIndex = -1;
     renderer.clearSystemMeta();
+    els.proximityWarning.classList.add('hidden');
     // Every galaxy is always cosmic-sourced now (the app boots straight
     // into cosmic view) - the back button stays visible in galaxy mode too,
     // now meaning "back to cosmos" rather than being hidden as the old
@@ -966,6 +973,20 @@
     els.infoValue6.textContent = formatYears(info.periodYears);
     els.infoRow5.classList.remove('hidden');
     els.infoRow6.classList.remove('hidden');
+    // Δv-from-circular % and eccentricity - both computed worker-side in
+    // sendStarInfo from the body's CURRENT state (not new physics, just
+    // exposing numbers the worker already derives). Shown together since
+    // both answer the same question ("how far off a clean circle is this
+    // right now") from two different angles.
+    if (typeof info.deltaVFromCircularPct === 'number') {
+      els.infoLabel7.textContent = 'Δv / eccentricity';
+      const sign = info.deltaVFromCircularPct >= 0 ? '+' : '';
+      els.infoValue7.textContent =
+        sign + info.deltaVFromCircularPct.toFixed(1) + '% · e=' + info.eccentricity.toFixed(2);
+      els.infoRow7.classList.remove('hidden');
+    } else {
+      els.infoRow7.classList.add('hidden');
+    }
     els.infoAction.textContent = '← Back to Galaxy';
     els.infoAction.classList.remove('hidden');
     els.infoAction.onclick = () => exitSystem();
@@ -975,7 +996,10 @@
     // ordinary orbital drift, not new unverified numbers.
     els.editRow.classList.remove('hidden');
     els.massValue.textContent = formatCompact(info.massEarth) + ' M⊕';
-    els.lockBtn.textContent = info.locked ? '🔓 Unlock Orbit' : '🔒 Lock Orbit';
+    const lockStrength = info.lockStrength || 0;
+    els.lockBtn.textContent = info.locked
+      ? (lockStrength >= 1 ? '🔓 Unlock Orbit' : `🔓 Unlock Orbit (${Math.round(lockStrength * 100)}% assisted)`)
+      : '🔒 Lock Orbit';
     els.stabilityDot.style.background = STABILITY_COLOR[info.stability] || STABILITY_COLOR.unknown;
     els.stabilityDot.title = 'Orbit stability: ' + (info.stability || 'unknown');
   }
@@ -1177,6 +1201,20 @@
     const locked = !!renderer.systemMeta[selectedIndex].locked;
     worker.postMessage({ type: 'lockOrbit', index: selectedIndex, locked: !locked });
   });
+
+  // --- Orbit Stability slider ("Realism <-> Stability") ---
+  // Sets the default blend strength (0-1) applied to bodies the user
+  // creates AFTER this point in THIS system only - see
+  // physics-worker.js's 'setOrbitStabilityDefault' handler. Pure physics
+  // (0%) is the default; this never touches the shared gravity/force-calc
+  // path, only how newly-placed bodies are post-processed each tick.
+  if (els.orbitStabilitySlider) {
+    els.orbitStabilitySlider.addEventListener('input', () => {
+      const pct = Number(els.orbitStabilitySlider.value);
+      els.orbitStabilityValue.textContent = pct + '%';
+      worker.postMessage({ type: 'setOrbitStabilityDefault', strength: pct / 100 });
+    });
+  }
 
   function flashSupernovaBanner() {
     els.infoFlash.textContent = '\u{1F4A5} Supernova!';
@@ -1477,6 +1515,16 @@
       pulseOverlay(1000);
       updateSystemStatus();
 
+      // Orbit Stability resets to 0% (pure physics) per system, matching
+      // the worker's own state.orbitStabilityDefault reset on entry - a
+      // slider setting from a previously-visited system must never leak
+      // into this one.
+      if (els.orbitStabilitySlider) {
+        els.orbitStabilitySlider.value = 0;
+        els.orbitStabilityValue.textContent = '0%';
+      }
+      els.proximityWarning.classList.add('hidden');
+
       // Always request a fresh, worker-computed (host-relative) snapshot
       // right after entering, whether freshly generated or loaded - keeps
       // localStorage in sync even if the tab closes before any autosave.
@@ -1493,6 +1541,12 @@
       }
     } else if (msg.type === 'systemBodyDelta') {
       applySystemBodyDelta(msg);
+    } else if (msg.type === 'proximityWarning') {
+      // Surfaces a real (if rare) wandering-absorber sweep-through as a
+      // diagnosable event instead of planets silently disappearing - see
+      // physics-worker.js's tick()/absorberProximityWarning wiring. Never
+      // alters anything, purely informational.
+      els.proximityWarning.classList.toggle('hidden', !msg.active);
     } else if (msg.type === 'collision') {
       handleCollision(msg);
     } else if (msg.type === 'cosmicReady') {

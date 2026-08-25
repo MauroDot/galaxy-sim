@@ -34,6 +34,7 @@ if (typeof module !== 'undefined' && typeof CORE_TYPE_CODE === 'undefined') {
 }
 
 const MIN_PLACEMENT_RADIUS = 8; // sim units - avoids a near-zero-radius divide in the orbit-velocity formula
+const PROXIMITY_WARNING_RADIUS_MULT = 8; // "nearby" = within 8x the system's own outermost orbit
 
 // --- Slot management ---
 
@@ -87,7 +88,7 @@ function buildBodiesSnapshot(state) {
       kind: meta.kind, name: meta.name, massEarth: meta.massEarth,
       orbitRadius: meta.orbitRadius, radiusPx: meta.radiusPx,
       color: meta.color, composition: meta.composition, tempK: meta.tempK,
-      locked: !!meta.locked, moons: meta.moons,
+      locked: !!meta.locked, lockStrength: meta.lockStrength, moons: meta.moons,
       relX: state.x[idx] - hostX, relY: state.y[idx] - hostY,
       relVX: state.vx[idx] - hostVX, relVY: state.vy[idx] - hostVY,
     });
@@ -131,7 +132,7 @@ function restoreBodiesFromSnapshot(state, bodies, G, currentStep) {
         collisionRadius: collisionRadiusFor(b.massEarth),
       }
     );
-    if (b.locked) lockOrbit(state, G, idx, currentStep);
+    if (b.locked) lockOrbit(state, G, idx, currentStep, b.lockStrength);
   }
 }
 
@@ -250,7 +251,7 @@ function recalcOrbit(state, G, index, currentStep) {
   const { vx, vy } = circularOrbitVelocity(G, state.mass[hostIdx], hostVX, hostVY, orbitRadius, angle0);
   state.vx[index] = vx; state.vy[index] = vy;
   meta.orbitRadius = orbitRadius;
-  if (meta.locked) lockOrbit(state, G, index, currentStep); // re-derive the kinematic params too
+  if (meta.locked) lockOrbit(state, G, index, currentStep, meta.lockStrength); // re-derive the kinematic params too
   return { index, ...meta };
 }
 
@@ -281,7 +282,17 @@ function recalcOrbit(state, G, index, currentStep) {
 //    otherwise correct. Stashing `lockedAtStep` here lets step() compute
 //    elapsed time as `(stepCount - lockedAtStep) * DT` instead, so `angle
 //    === phase0` at the exact moment of locking - zero discontinuity.
-function lockOrbit(state, G, index, currentStep) {
+// `strength` (0-1, default 1 = today's full lock) is the "Orbit Stability"
+// blend factor: at 1, step()'s locked-orbit block skips force/drift for
+// this body entirely and sets its position kinematically, exactly as
+// before. Below 1, step() instead lets the body accumulate REAL gravity
+// from the shared force calc like every other body, then nudges it toward
+// this same kinematic ideal by `strength` each tick - see step()'s
+// locked-orbit block in physics-worker.js for the actual blend. This
+// keeps "one shared force-calc path for every body" true even for
+// partially-stabilized bodies; only the post-hoc position/velocity value
+// differs, never how gravity itself is computed.
+function lockOrbit(state, G, index, currentStep, strength) {
   const meta = state.systemMeta[index];
   if (!meta) return null;
   const hostIdx = meta.hostIndex;
@@ -290,10 +301,13 @@ function lockOrbit(state, G, index, currentStep) {
   const dx = state.x[index] - hostX, dy = state.y[index] - hostY;
   const radius = Math.max(MIN_PLACEMENT_RADIUS, Math.hypot(dx, dy));
   const angularSpeed = Math.sqrt((G * hostMass) / radius) / radius;
+  const clampedStrength = Math.min(1, Math.max(0, strength ?? 1));
+  if (clampedStrength <= 0) return unlockOrbit(state, index); // 0% stability = no lock at all
   meta.locked = true;
+  meta.lockStrength = clampedStrength;
   state.lockedOrbit[index] = {
     radius, angularSpeed, phase0: Math.atan2(dy, dx), hostIndex: hostIdx,
-    lockedAtStep: currentStep || 0,
+    lockedAtStep: currentStep || 0, strength: clampedStrength,
   };
   return { index, ...meta };
 }
@@ -302,6 +316,7 @@ function unlockOrbit(state, index) {
   const meta = state.systemMeta[index];
   if (!meta) return null;
   meta.locked = false;
+  meta.lockStrength = 0;
   delete state.lockedOrbit[index];
   return { index, ...meta };
 }
@@ -472,6 +487,42 @@ function stabilityFor(currentRadius, nominalRadius) {
   return 'unstable';
 }
 
+// The largest nominal orbitRadius among this system's live bodies, or null
+// if none - used to scale the proximity-warning threshold to this
+// system's own size rather than a fixed sim-unit constant.
+function outermostOrbitRadius(state) {
+  let max = null;
+  for (const idx of state.systemBodyIndices) {
+    if (!state.alive[idx]) continue;
+    const r = state.systemMeta[idx] && state.systemMeta[idx].orbitRadius;
+    if (r && (max === null || r > max)) max = r;
+  }
+  return max;
+}
+
+// --- Proximity warning (surfaces a rare-but-real wandering absorber sweep
+// as a diagnosable event instead of planets silently disappearing - see
+// physics-worker.js's step() for where this is called each tick a system
+// is loaded). Pure distance check: never alters gravity, never repels or
+// protects anything, just reports whether one is currently close enough
+// to explain instability the user is about to see.
+function absorberProximityWarning(state, absorberIndices, hostIdx) {
+  if (hostIdx === -1 || !absorberIndices.length) return null;
+  const outermost = outermostOrbitRadius(state);
+  if (!outermost) return null;
+  const threshold = outermost * PROXIMITY_WARNING_RADIUS_MULT;
+  const hostX = state.x[hostIdx], hostY = state.y[hostIdx];
+  let closest = null;
+  for (const idx of absorberIndices) {
+    if (!state.alive[idx] || idx === hostIdx) continue;
+    const dist = Math.hypot(state.x[idx] - hostX, state.y[idx] - hostY);
+    if (dist <= threshold && (!closest || dist < closest.distance)) {
+      closest = { index: idx, distance: dist, mass: state.mass[idx] };
+    }
+  }
+  return closest;
+}
+
 if (typeof self !== 'undefined') {
   self.findFreeSlot = findFreeSlot;
   self.circularOrbitVelocity = circularOrbitVelocity;
@@ -494,6 +545,8 @@ if (typeof self !== 'undefined') {
   self.addMoon = addMoon;
   self.checkCollisions = checkCollisions;
   self.stabilityFor = stabilityFor;
+  self.outermostOrbitRadius = outermostOrbitRadius;
+  self.absorberProximityWarning = absorberProximityWarning;
 }
 if (typeof module !== 'undefined') {
   module.exports = {
@@ -501,6 +554,8 @@ if (typeof module !== 'undefined') {
     clearSystemBodies, restoreBodiesFromSnapshot, pushUndoSnapshot, undo,
     createPlanet, deleteBody, deleteMoon, adjustMass, cycleColor,
     recalcOrbit, lockOrbit, unlockOrbit, addAsteroidField, addComet,
-    addMoon, checkCollisions, stabilityFor, MIN_PLACEMENT_RADIUS,
+    addMoon, checkCollisions, stabilityFor, outermostOrbitRadius,
+    absorberProximityWarning, MIN_PLACEMENT_RADIUS,
+    PROXIMITY_WARNING_RADIUS_MULT,
   };
 }
