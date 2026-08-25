@@ -3,6 +3,17 @@
 A 2D galaxy-scale N-body gravity simulator running entirely in the browser:
 vanilla JS, no frameworks, no build step.
 
+- **Cosmic Web Sandbox** ([src/cosmic-web.js](src/cosmic-web.js), [src/galaxy-morphology.js](src/galaxy-morphology.js), [src/cosmic-editor.js](src/cosmic-editor.js), [src/universe-codec.js](src/universe-codec.js)): the app's actual entry point is now one level up from a single galaxy - a cosmic web of 20-50 galaxies the user pans across, zooms into, and edits.
+  - *Four galaxy morphologies* (spiral/elliptical/irregular/lenticular), each its own position/velocity generator sharing the exotic-body rolling (black holes/quasars/neutron stars) spiral already uses, so rarity stays consistent everywhere. Spiral is the untouched, already-tuned `generateGalaxy()`; the other three are new.
+  - *Getting these stable took real empirical tuning, twice over.* First pass gave each star a velocity from its *actual measured* enclosed mass (sorted-by-radius cumulative sum of the real generated population) rather than a hand-picked formula - reasonable on paper, but tested empirically (30-trial sweeps against a "does it disperse over 60 sim-seconds" check, mirroring the collision-radius tuning discipline above) it was measurably *less* stable than a smooth analytic approximation even for lenticular's profile, which is identical to spiral's own proven-stable one. Every morphology now uses a smooth per-shape analytic formula instead (a closed-form Gaussian-CDF enclosed-mass fraction for elliptical/irregular; spiral's own linear formula, reused outright, for lenticular) - discrete sampling noise in a population of a few hundred stars apparently matters more than getting the density profile shape exactly right. Second, a real bug: black holes/quasars were falling through to the same velocity-assignment code as ordinary stars, occasionally putting a 30000-mass body on a ~17-unit/s orbital path straight through a star cluster - fixed by giving them their own near-zero drift velocity (matching spiral's treatment) before the shared code ever runs. Irregular's clustered layout needed one more pass (jitter widened until each sub-cluster's local density stopped rivaling the whole simulation's tolerance) to land in the same stability ballpark as spiral's own baseline (worst-case ~2.5-2.8x radius growth over a 60-second sweep, for either).
+  - *Cosmic web layout*: 3-6 cluster centers scattered across a 100,000×100,000-unit plane, connected by filament line segments; each galaxy lands near a cluster (dense), along a filament (linear scatter), or rarely isolated in a void, with a 1,200-unit minimum separation enforced by rejection/resample. Verified (not assumed) to land in the spec's stated 1,000-10,000-unit spacing range across many seeds.
+  - *Cosmic-layer gravity* is a second, much lighter simulation layer next to the existing per-galaxy `state` - not a second Worker. It ticks inside the *same* accumulator loop in `physics-worker.js`'s `tick()`, so it inherits play/pause/speed/Time Warp for free, and keeps running even while a galaxy is loaded and zoomed into. Reuses the app's own `G`; "Crazy Physics"/"Low Gravity" scale it by the same ratio, not a separate value. Softening is ~25x the per-galaxy value (galaxy-to-galaxy spacing is ~2-3 orders of magnitude above intra-galaxy spacing), tuned so a full cluster orbit takes on the order of an hour at 1x - "orbit each other slowly," verified by measuring actual angular displacement over a simulated sim-hour, not just computed on paper.
+  - *Coordinate frames are deliberately never unified.* A galaxy's own star-level simulation always stays in its own local frame (core pinned at that galaxy's own origin, exactly like the existing single-galaxy core-pinning), regardless of where it sits on the cosmic plane - "cosmic position" is a property only of the lightweight cosmic layer. Only one galaxy's stars are ever simulated at a time (`enterGalaxy`/`exitGalaxy`, mirroring `enterSystem`/`evictSystem`'s on-demand generate-or-restore pattern one level down); the rest are position/velocity/mass point-masses only.
+  - *Cosmic↔galaxy is a hard cut, not a continuous tween* - unlike galaxy↔system, which has always stayed inside one coordinate space, a galaxy's cosmic-plane position and its own pinned-at-origin local frame are two unrelated origins with no continuous function between them. The camera tweens toward the target in cosmic coordinates while the existing transition-overlay flash plays, then swaps mode/camera/state with no interpolation once the overlay is near its most opaque, before fading it away - reusing the existing transition primitives, not a new masking mechanism.
+  - *Sandbox*: Create Galaxy (click-to-place), right-click to retype/increase mass/delete (the worker also supports renaming a galaxy, not yet wired to a UI control), Merge/Collision (select two - both are the same cosmic-layer-only mass-weighted, momentum-conserving merge `system-editor.js`'s collision rule already uses one level down; "Collision" just adds a bigger particle-burst flourish first; no two galaxies' stars are ever simulated together, an explicit scope decision), a 10-entry undo stack. A cosmic action targeting the *currently-loaded* galaxy evicts its star-level state first, mirroring the existing evict-before-reassign invariant.
+  - *Save/share*: a full snapshot (not seed+diff) of every galaxy's position/velocity/mass/morphology/star-count, packed binary + base64url exactly like the existing `?system=` codec (reuses its base64url helpers directly) - 50 galaxies (the spec's own stated max) lands at ~1,000 characters, measured. Names and per-galaxy ids are never stored, regenerated deterministically at decode time, the same "don't round-trip what can be regenerated" principle `?system=` already uses.
+  - *Persistence* stores the cosmic-layer summary only (`galaxysim:universe:${seed}`) - never every galaxy's full star array at once, matching the same "only the active galaxy is ever loaded" budget the perf section below states. Whichever individual galaxy(s) get zoomed into and edited persist via the *existing*, unmodified per-derived-seed system storage, just fed a per-galaxy seed (`${universeSeed}:galaxy:${galaxyId}`) instead of the app's single seed field at the one point that matters.
+  - Achievements and a fourth "planet surface" zoom tier are both explicitly out of scope for this pass (marked optional in the spec, and omitted from its own stated implementation order).
 - **Barnes-Hut quadtree** ([src/quadtree.js](src/quadtree.js)) for O(n log n) gravity instead of the naive O(n²) all-pairs sum.
 - **Physics runs in a Web Worker** ([src/physics-worker.js](src/physics-worker.js)) at a fixed 60 Hz tick, symplectic (semi-implicit) Euler integration, so the main thread stays free for rendering. The worker also ages every star each step and triggers supernovae.
 - **Stellar diversity** ([src/star-types.js](src/star-types.js)): seven spectral types (O/B/A/F/G/K/M), each with a realistic relative frequency (mostly M dwarfs, ~1% O giants), mass, radius and main-sequence lifetime. Shared between the worker (generation, aging) and the main thread (color, info panel) so there's one source of truth.
@@ -24,7 +35,7 @@ vanilla JS, no frameworks, no build step.
   - *Save & share*: "Save System" packs the current system (host type/mass + each body's kind/mass/current orbital radius & angle/composition) into a compact binary layout, base64url-encoded into a `?system=` URL param - no JSON, so a worst-case ~100-body system still lands around ~1,200 characters (verified, not assumed). Velocity is never stored; it's recomputed at decode time from radius/angle/`G`, the same formula used everywhere else. Opening a shared link allocates a synthetic pinned host far outside the visible galaxy and lands straight in system view, labeled "Shared System" (or "Loaded: `<name>`'s System" if a creator name is ever added to the payload).
   - *Experiments*: "Crazy Physics" (G×10) and "Low Gravity" (G÷4) are mutually exclusive toggles on the one shared `G` used by gravity everywhere (not a per-body-group special case) - both reset on reload/regenerate, same as everything else in this section. "Time Warp" is just the existing speed control jumped to a high preset and restored on toggle-off, not a new mechanism. All persist to `localStorage` per star and support a 10-entry undo stack (worker-side, popped via the Undo button or Ctrl+Z) plus autosave every ~5s and after every mutating action.
 - **Canvas 2D renderer** ([src/renderer.js](src/renderer.js)) with pan (drag) and zoom (scroll wheel), decoupled from the physics tick rate so rendering stays smooth even if physics lags. Stars render in their spectral-type color at a size derived from their radius; black holes are a solid dark disc with a purple glow ring; quasars are a brighter/bigger version of that same ring, in yellow/white; neutron stars are a tiny, extra-bright sparkle; the core is the same dark-disc-plus-glow language as a black hole, just bigger and growing. In system view, planets get faint orbit-ring guides and cosmetic moon dots. Click a body (a small in-place click, not a drag) to select it; hover any body for a brief tooltip.
-- **UI controls** ([src/main.js](src/main.js)): play/pause, speed (0-20x), seed, star count, "new galaxy" (random seed), reset, live FPS / physics-Hz / star-count / black-hole-count / supernova-count / absorbed-count / core-growth stats, a full color legend, a color-coded mode indicator (blue = Galaxy View, green = System View - click it to zoom back out), a "Back to Galaxy" button, and an info panel with type-specific fields plus an action button ("View System →" / "← Back to Galaxy") for every body type: star, core, black hole, quasar, neutron star, planet, and moon.
+- **UI controls** ([src/main.js](src/main.js)): play/pause, speed (0-20x), universe seed, galaxy count (20-50), "new universe" (random seed), reset, live FPS / physics-Hz / star-count / black-hole-count / supernova-count / absorbed-count / core-growth stats, a full color legend, a color-coded mode indicator (yellow = Cosmic View, blue = Galaxy View, green = System View - click it to go back one level), a back button that reads "← Back to Cosmos" or "← Back to Galaxy" depending on depth, and an info panel with type-specific fields plus an action button ("Enter Galaxy →" / "View System →" / "← Back") for every body type: galaxy, star, core, black hole, quasar, neutron star, planet, and moon.
 
 Tested at 500 stars: ~1.2 ms/physics-step (~0.1 ms/galaxy generation with the
 full stellar + black-hole + exotic-body logic), steady 60 FPS render and ~60 Hz
@@ -52,41 +63,49 @@ Then open **http://localhost:8000/** in a browser.
 
 | Control | Effect |
 |---|---|
-| Play / Pause | starts/stops the simulation |
+| Play / Pause | starts/stops the simulation (all three tiers - cosmic, galaxy, system - share one clock) |
 | Speed slider | 0x-20x physics rate |
-| Seed field + Reset | re-run the same galaxy from scratch |
-| New Galaxy | generate a fresh random seed |
-| Star count | bodies to simulate (central mass + disk stars) |
-| Scroll | zoom |
+| Universe Seed field + Reset | re-run the same universe from scratch |
+| New Universe | generate a fresh random seed |
+| Galaxies | how many galaxies the universe generates (20-50) |
+| Scroll | zoom (cosmic view has its own, much wider zoomed-out range) |
 | Drag | pan |
-| Click a body | show its info panel (fields vary by type) |
+| Click a body | show its info panel (fields vary by type, including galaxies in cosmic view) |
 | Hover a body | brief tooltip |
+| "Enter Galaxy →" (info panel, cosmic view) | hard-cut zoom into that galaxy's own stars |
 | "View System →" (info panel, on a star) | zoom smoothly into that star's planets |
-| "← Back to Galaxy" (back button, mode indicator, or info panel on a planet/moon) | zoom back out |
+| Back button / mode indicator | go back exactly one level (system→galaxy, or galaxy→cosmos) |
 | Space | toggle play/pause |
 | D | toggle debug overlay (labeled bounding box on every live body - green if on-screen, red if clipped) |
+| Create Galaxy / Merge Galaxies / Collision (cosmic view toolbar) | spawn a galaxy, or select two (click the button, then two galaxies) to merge/collide them |
+| Right-click a galaxy (cosmic view) | context menu: merge, mass ×1.5, change type, delete |
 | Create Planet / Add Asteroid Field / Add Comet / Add Moon (system view toolbar) | spawn a new body (Create Planet and Add Moon are click-to-place; the other two are instant) |
 | Right-click a body (system view) | context menu: mass ×1.5/÷1.5, cycle color, delete, copy orbital data |
 | Delete / M / C / R (system view, body selected) | delete / focus mass field / cycle color / recalculate a fresh circular orbit |
-| Ctrl+Z / Undo button (system view) | undo the last create/delete/edit (10-entry stack) |
-| Save System (system view toolbar) | generate a shareable `?system=` URL for the current system |
-| Crazy Physics / Low Gravity / Time Warp (side panel) | G×10 / G÷4 / speed jump - affect the whole simulation, reset on reload |
+| Ctrl+Z / Undo button | undo the last create/delete/edit at the current tier (10-entry stack, cosmic and system each have their own) |
+| Save Universe / Save System (toolbars) | generate a shareable `?universe=` / `?system=` URL |
+| Crazy Physics / Low Gravity / Time Warp (side panel) | G×10 / G÷4 / speed jump - affect the whole simulation (all tiers), reset on reload |
 | Esc (system view) | exit creation mode / close the context menu |
 
-To watch a supernova, push the speed slider to 10x+ and wait 20-30s (or
-click New Galaxy a few times - some galaxies roll an O-star close to death
-at spawn and one goes within seconds). Black holes are rarer (~1-2 per
-500-star galaxy) - click New Galaxy until "Black Holes" in the stats reads
-1 or more, then watch the "Absorbed" counter climb as nearby stars fall in.
-Quasars (~0.5 per galaxy) and neutron stars (~2-3 per galaxy) are rarer
-still - keep clicking New Galaxy and watch the stats, or just look for a
-bright yellow ring (quasar) or an extra-bright sparkle (neutron star)
-among the ordinary stars. To see a planetary system, click any ordinary
-star (or the core near the middle of the galaxy - "Sol") and use "View
-System →" in its info panel. To watch the core grow, click New Galaxy
-until "Black Holes" reads 2 or more, then just watch - the core's glow
-visibly swells (and "Core growth" appears in the stats) once it eats one,
-usually within the first minute or so at 1x speed.
+The app now opens straight into cosmic view - a scattering of glowing dots
+(blue = spiral, red = elliptical, yellow = irregular, white/pale =
+lenticular), sized by mass. Click one, then "Enter Galaxy →" in its info
+panel, to zoom into that galaxy's actual stars - from there, everything
+below works exactly as before.
+
+To watch a supernova, push the speed slider to 10x+ and wait 20-30s once
+inside a galaxy (or enter a few different galaxies - some roll an O-star
+close to death at spawn and one goes within seconds). Black holes are
+rarer (~1-2 per galaxy) - hop between a few galaxies until "Black Holes"
+in the stats reads 1 or more, then watch the "Absorbed" counter climb as
+nearby stars fall in. Quasars and neutron stars are rarer still - keep
+looking, or just look for a bright yellow ring (quasar) or an extra-bright
+sparkle (neutron star) among the ordinary stars. To see a planetary
+system, click any ordinary star (or that galaxy's own core) and use "View
+System →" in its info panel. To watch the core grow, find a galaxy with 2+
+black holes, then just watch - the core's glow visibly swells (and "Core
+growth" appears in the stats) once it eats one, usually within the first
+minute or so at 1x speed.
 
 To build your own system, enter any star's system view and use the
 toolbar: "Create Planet" then click to place one, "Add Asteroid Field" /
@@ -95,34 +114,51 @@ click any body to edit or delete it, or select it and use the info
 panel's mass/color/lock/delete row. Drop two bodies on (almost) the same
 spot to watch them collide and merge. "Save System" builds a shareable
 link that reproduces the system for whoever opens it - try it in a second
-tab. Everything (including a hand-edited system) survives a full page
-reload as long as the same seed is in the Seed field.
+tab. To build your own cosmic web, use the cosmic toolbar the same way:
+"Create Galaxy" to place one, "Merge Galaxies"/"Collision" (click the
+button, then two galaxies) to combine two into one, right-click a galaxy
+to retype/grow/delete it (or start a merge from there too). "Save
+Universe" builds a shareable link
+the same way "Save System" does. Everything (a hand-edited universe, and
+any hand-edited system within it) survives a full page reload as long as
+the same seed is in the Universe Seed field.
 
 ## File structure
 
 ```
 galaxy-sim/
-├── index.html          # page shell, canvas, UI panel, info/mode/tooltip UI
-├── style.css            # dark theme, all panel/overlay/tooltip styling
+├── index.html                     # page shell, canvas, UI panel, cosmic/system HUDs, info/mode/tooltip UI
+├── style.css                       # dark theme, all panel/overlay/tooltip/HUD styling
 └── src/
-    ├── quadtree.js       # Barnes-Hut quadtree (force calc)
-    ├── star-types.js      # every body-type table/constant: spectral types, black hole,
-    │                        quasar, neutron star, planet/moon (single source of truth,
-    │                        shared by the worker via importScripts and the main thread
-    │                        via a <script> tag)
-    ├── galaxy.js           # seeded procedural galaxy generation (stars + all exotic bodies)
-    ├── system-bodies.js     # seeded procedural planet/moon generation for one star (worker-only)
-    ├── system-editor.js      # worker-side system editor: create/delete/edit bodies, asteroid
-    │                            fields/comets/moons, collisions, undo stack (worker-only)
-    ├── share-codec.js          # packed-binary encode/decode for the "Save This System" share URL
-    │                            (main-thread <script> tag, not importScripts)
-    ├── physics-worker.js         # simulation loop: gravity, aging, supernova, absorber-capture,
-    │                               system enter/exit/snapshot, and the system-editor message
-    │                               handlers - runs off main thread
-    ├── renderer.js                 # canvas drawing, camera/pan/zoom + tween, particle bursts,
-    │                                 orbit rings/moons, selection/new-body/delete-fade visuals,
-    │                                 hit-testing for click, hover, and right-click
-    └── main.js                      # UI wiring, worker messaging, render loop, audio,
-                                        galaxy<->system mode state machine, creation/context-menu/
-                                        share-dialog UI, localStorage persistence, ?system= loading
+    ├── quadtree.js                  # Barnes-Hut quadtree (force calc)
+    ├── star-types.js                 # every body-type table/constant: spectral types, black hole,
+    │                                   quasar, neutron star, planet/moon, galaxy morphology weights/
+    │                                   colors (single source of truth, shared by the worker via
+    │                                   importScripts and the main thread via a <script> tag)
+    ├── galaxy.js                      # seeded procedural spiral galaxy generation (stars + exotic bodies)
+    ├── galaxy-morphology.js            # elliptical/irregular/lenticular generation (spiral falls
+    │                                     through to the untouched galaxy.js) - worker-only
+    ├── cosmic-web.js                    # universe layout (cluster/filament/void) + cosmic-layer
+    │                                     gravity step - worker-only
+    ├── cosmic-editor.js                  # worker-side cosmic editor: create/delete/merge/collide/
+    │                                     retype/rescale galaxies, undo stack - worker-only
+    ├── system-bodies.js                   # seeded procedural planet/moon generation for one star (worker-only)
+    ├── system-editor.js                    # worker-side system editor: create/delete/edit bodies,
+    │                                     asteroid fields/comets/moons, collisions, undo stack (worker-only)
+    ├── share-codec.js                       # packed-binary encode/decode for the "Save This System"
+    │                                     share URL (main-thread <script> tag, not importScripts)
+    ├── universe-codec.js                     # packed-binary encode/decode for the "Save Universe"
+    │                                     share URL, reuses share-codec.js's base64url helpers
+    ├── physics-worker.js                      # simulation loop: gravity, aging, supernova,
+    │                                     absorber-capture, system AND cosmic enter/exit/snapshot,
+    │                                     and both editors' message handlers - runs off main thread
+    ├── renderer.js                             # canvas drawing, camera/pan/zoom + tween (mode-aware
+    │                                     zoom clamp), particle bursts, cosmic dots/trails, orbit
+    │                                     rings/moons, selection/new-body/delete-fade visuals,
+    │                                     hit-testing for click, hover, and right-click
+    └── main.js                                  # UI wiring, worker messaging, render loop, audio,
+                                          cosmic<->galaxy<->system mode state machine (incl. the
+                                          cosmic<->galaxy hard-cut transition), creation/context-menu/
+                                          share-dialog UI, localStorage persistence,
+                                          ?system=/?universe= loading
 ```

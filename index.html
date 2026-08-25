@@ -12,9 +12,16 @@
   <div id="transition-overlay"></div>
   <div id="tooltip" class="hidden"></div>
 
+  <!-- Standalone (not inside #systemHud/#cosmicHud, which are each shown
+       only in their own mode): the back button needs to stay visible and
+       usable across BOTH system mode ("back to galaxy") and galaxy mode
+       ("back to cosmos") now that cosmic is a third tier, so its
+       visibility is controlled entirely by its own .hidden class in JS,
+       never by a mode-scoped parent container's display:none. -->
+  <button id="backToGalaxyBtn" class="hidden" title="Go back one level">← Back to Galaxy</button>
+
   <div id="systemHud">
     <div id="systemToolbar">
-      <button id="backToGalaxyBtn" class="hidden" title="Return to the galaxy view">← Back to Galaxy</button>
       <button id="createPlanetBtn" title="Click, then click the canvas to place a new planet in a circular orbit">+ Create Planet</button>
       <button id="addAsteroidBtn" title="Spawn a belt of 5-10 small asteroids">🪨 Add Asteroid Field</button>
       <button id="addCometBtn" title="Launch a comet on an eccentric, fast-moving path">☄ Add Comet</button>
@@ -39,6 +46,27 @@
     <button id="ctxCopy">Copy Orbital Data</button>
   </div>
 
+  <div id="cosmicHud">
+    <div id="cosmicToolbar">
+      <button id="createGalaxyBtn" title="Click, then click the plane to place a new galaxy">+ Create Galaxy</button>
+      <button id="mergeGalaxiesBtn" title="Click, then click two galaxies to merge them">🌌 Merge Galaxies</button>
+      <button id="collideGalaxiesBtn" title="Click, then click two galaxies to collide them (same result as Merge, with a dramatic flourish)">💥 Collision</button>
+      <button id="undoCosmicBtn" title="Undo the last cosmic-level action (Ctrl+Z)">↶ Undo</button>
+      <button id="saveUniverseBtn" title="Generate a shareable link that reproduces this universe">🔗 Save Universe</button>
+    </div>
+    <div id="cosmicStatusLine">
+      Galaxies: <span id="cosmicStatusCount">-</span>
+      <span id="mergeSelectionStatus"></span>
+    </div>
+  </div>
+
+  <div id="galaxyContextMenu" class="hidden">
+    <button id="ctxGalaxyMerge">Merge With...</button>
+    <button id="ctxGalaxyIncreaseMass">Increase Mass ×1.5</button>
+    <button id="ctxGalaxyChangeType">Change Type</button>
+    <button id="ctxGalaxyDelete">Delete</button>
+  </div>
+
   <div id="shareDialog" class="hidden">
     <h3>Share this system</h3>
     <input id="shareUrlInput" type="text" readonly />
@@ -51,7 +79,7 @@
   <div id="ui-panel">
     <h1>Galaxy Sim</h1>
 
-    <div id="modeIndicator" class="mode-galaxy">Galaxy View</div>
+    <div id="modeIndicator" class="mode-cosmic">Cosmic View</div>
 
     <div class="row">
       <button id="playPauseBtn">⏸ Pause</button>
@@ -64,17 +92,17 @@
     </div>
 
     <div class="row">
-      <label for="seedInput">Seed</label>
+      <label for="seedInput">Universe Seed</label>
       <input id="seedInput" type="text" placeholder="seed" />
     </div>
 
     <div class="row">
-      <label for="starCountInput">Stars</label>
-      <input id="starCountInput" type="number" min="10" max="3000" value="500" />
+      <label for="starCountInput">Galaxies</label>
+      <input id="starCountInput" type="number" min="20" max="50" value="32" />
     </div>
 
     <div class="row">
-      <button id="regenBtn">🎲 New Galaxy</button>
+      <button id="regenBtn">🎲 New Universe</button>
     </div>
 
     <div class="row" id="experimentRow" title="Affects the whole simulation, not just the zoomed-in system">
@@ -107,6 +135,7 @@
     </div>
 
     <p class="hint">Scroll to zoom · Drag to pan · Space to play/pause · Click a body for info · D for debug overlay</p>
+    <p class="hint">Click a galaxy to view it, then "Enter Galaxy →" to zoom in · right-click a galaxy to edit it</p>
     <p class="hint">In a system: right-click a body to edit · Delete to remove · M/C/R to adjust mass/color/orbit · Ctrl+Z to undo</p>
   </div>
 
@@ -138,6 +167,7 @@
 
   <script src="src/star-types.js"></script>
   <script src="src/share-codec.js"></script>
+  <script src="src/universe-codec.js"></script>
   <script src="src/renderer.js"></script>
   <script src="src/main.js"></script>
 </body>

@@ -199,14 +199,64 @@ const STAR_TYPE_CUMULATIVE = (() => {
   return STAR_TYPES.map((t) => (sum += t.weight));
 })();
 
+// Generic weighted-index sampler, factored out of pickStarTypeIndex so
+// galaxy-morphology.js can supply a per-morphology weight table (ellipticals
+// skew old/red, spirals keep the default incl. O/B, etc.) without
+// duplicating the cumulative-sum-and-pick algorithm itself. `cumulative`
+// need not sum to 100 - only relative magnitude matters.
+function pickWeightedIndex(rand, cumulative) {
+  const r = rand() * cumulative[cumulative.length - 1];
+  for (let i = 0; i < cumulative.length; i++) {
+    if (r <= cumulative[i]) return i;
+  }
+  return cumulative.length - 1;
+}
+
 // Pick a spectral type index using the supplied rand() source (0..1).
 function pickStarTypeIndex(rand) {
-  const r = rand() * STAR_TYPE_CUMULATIVE[STAR_TYPE_CUMULATIVE.length - 1];
-  for (let i = 0; i < STAR_TYPE_CUMULATIVE.length; i++) {
-    if (r <= STAR_TYPE_CUMULATIVE[i]) return i;
-  }
-  return STAR_TYPES.length - 1;
+  return pickWeightedIndex(rand, STAR_TYPE_CUMULATIVE);
 }
+
+// --- Galaxy morphology (Cosmic Web Sandbox) ---
+// Per-morphology spectral-type weight overrides, same [O,B,A,F,G,K,M] order
+// as STAR_TYPES. `null` means "use the default STAR_TYPE_CUMULATIVE as-is"
+// (spiral - unchanged from the original single-galaxy behavior). These are
+// narrative/visual biases, not physically load-bearing the way gravity
+// tuning is - ellipticals skew heavily toward old K/M stars (real ellipticals
+// are dominated by an old, red population with little ongoing star
+// formation), irregulars are flatter/more chaotic, lenticular sits between
+// spiral and elliptical.
+const GALAXY_MORPHOLOGIES = ['spiral', 'elliptical', 'irregular', 'lenticular'];
+const MORPHOLOGY_STAR_WEIGHTS = {
+  spiral: null,
+  elliptical: [0.1, 0.2, 0.5, 2, 6, 26, 65.2],
+  irregular: [8, 10, 12, 14, 16, 18, 22],
+  lenticular: [0.5, 1, 2, 5, 12, 28, 51.5],
+};
+const MORPHOLOGY_STAR_CUMULATIVE = (() => {
+  const out = {};
+  for (const key of GALAXY_MORPHOLOGIES) {
+    const weights = MORPHOLOGY_STAR_WEIGHTS[key];
+    if (!weights) { out[key] = STAR_TYPE_CUMULATIVE; continue; }
+    let sum = 0;
+    out[key] = weights.map((w) => (sum += w));
+  }
+  return out;
+})();
+function pickStarTypeIndexForMorphology(rand, morphology) {
+  return pickWeightedIndex(rand, MORPHOLOGY_STAR_CUMULATIVE[morphology] || STAR_TYPE_CUMULATIVE);
+}
+
+// Cosmic-view galaxy-dot colors, keyed by morphology (spec: blue=spiral,
+// red=elliptical, yellow=irregular; lenticular isn't specified in the spec -
+// pale/white chosen as a fourth visually-distinct color, reading as "between"
+// spiral-blue and elliptical-red).
+const GALAXY_MORPHOLOGY_COLORS = {
+  spiral: '#5d8dff',
+  elliptical: '#ff6b4d',
+  irregular: '#ffd24d',
+  lenticular: '#e8e8f0',
+};
 
 function starTypeByCode(code) {
   return code === CORE_TYPE_CODE ? null : STAR_TYPES[code];
@@ -255,6 +305,11 @@ if (typeof self !== 'undefined') {
   self.EARTH_MASS_IN_SOLAR = EARTH_MASS_IN_SOLAR;
   self.PLANET_COMPOSITIONS = PLANET_COMPOSITIONS;
   self.cyclePlanetColor = cyclePlanetColor;
+  self.pickWeightedIndex = pickWeightedIndex;
+  self.GALAXY_MORPHOLOGIES = GALAXY_MORPHOLOGIES;
+  self.MORPHOLOGY_STAR_WEIGHTS = MORPHOLOGY_STAR_WEIGHTS;
+  self.pickStarTypeIndexForMorphology = pickStarTypeIndexForMorphology;
+  self.GALAXY_MORPHOLOGY_COLORS = GALAXY_MORPHOLOGY_COLORS;
 }
 if (typeof module !== 'undefined') {
   module.exports = {
@@ -271,5 +326,7 @@ if (typeof module !== 'undefined') {
     MOON_MASS_FRACTION, UNDO_STACK_LIMIT, DEFAULT_G, CRAZY_PHYSICS_G_MULT,
     LOW_GRAVITY_G_DIV, SHARE_FORMAT_VERSION,
     EARTH_MASS_IN_SOLAR, PLANET_COMPOSITIONS, cyclePlanetColor,
+    pickWeightedIndex, GALAXY_MORPHOLOGIES, MORPHOLOGY_STAR_WEIGHTS,
+    pickStarTypeIndexForMorphology, GALAXY_MORPHOLOGY_COLORS,
   };
 }

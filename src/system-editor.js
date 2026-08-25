@@ -111,8 +111,9 @@ function clearSystemBodies(state) {
 // Places a list of {kind, massEarth, radiusPx, color, composition, tempK,
 // moons, relX, relY, relVX, relVY, locked} bodies relative to the CURRENT
 // host (state.focusIndex must already be set). Used by enterSystem's
-// "load from saved", undo(), and loadSharedSystem().
-function restoreBodiesFromSnapshot(state, bodies) {
+// "load from saved", undo(), and loadSharedSystem(). `G`/`currentStep` are
+// only needed for the locked-body branch - see lockOrbit()'s comment for why.
+function restoreBodiesFromSnapshot(state, bodies, G, currentStep) {
   const hostIdx = state.focusIndex;
   const hostX = state.x[hostIdx], hostY = state.y[hostIdx];
   const hostVX = state.vx[hostIdx], hostVY = state.vy[hostIdx];
@@ -130,15 +131,7 @@ function restoreBodiesFromSnapshot(state, bodies) {
         collisionRadius: collisionRadiusFor(b.massEarth),
       }
     );
-    if (b.locked) {
-      const dx = state.x[idx] - hostX, dy = state.y[idx] - hostY;
-      const radius = Math.hypot(dx, dy);
-      const speed = Math.hypot(state.vx[idx] - hostVX, state.vy[idx] - hostVY);
-      state.lockedOrbit[idx] = {
-        radius, angularSpeed: radius > 0 ? speed / radius : 0,
-        phase0: Math.atan2(dy, dx), hostIndex: hostIdx,
-      };
-    }
+    if (b.locked) lockOrbit(state, G, idx, currentStep);
   }
 }
 
@@ -158,13 +151,13 @@ function pushUndoSnapshot(state) {
 // Pops the last undo entry and restores it. Returns true if something was
 // restored, false if the stack was empty. Deliberately does NOT push a new
 // undo entry for the undo itself (no redo stack in this feature).
-function undo(state) {
+function undo(state, G, currentStep) {
   if (!state.undoStack.length || state.focusIndex === -1) return false;
   const entry = state.undoStack.pop();
   clearSystemBodies(state);
   state.nextCustomIndex = entry.nextCustomIndex;
   state.nextMoonId = entry.nextMoonId;
-  restoreBodiesFromSnapshot(state, entry.bodies);
+  restoreBodiesFromSnapshot(state, entry.bodies, G, currentStep);
   return true;
 }
 
@@ -245,7 +238,7 @@ function cycleColor(state, index) {
 // "R key": reset velocity to a fresh circular orbit at the body's CURRENT
 // position (re-baselines orbitRadius too, so stability reads as "just
 // fixed" going forward).
-function recalcOrbit(state, G, index) {
+function recalcOrbit(state, G, index, currentStep) {
   const meta = state.systemMeta[index];
   if (!meta) return null;
   const hostIdx = meta.hostIndex;
@@ -257,22 +250,50 @@ function recalcOrbit(state, G, index) {
   const { vx, vy } = circularOrbitVelocity(G, state.mass[hostIdx], hostVX, hostVY, orbitRadius, angle0);
   state.vx[index] = vx; state.vy[index] = vy;
   meta.orbitRadius = orbitRadius;
-  if (meta.locked) lockOrbit(state, G, index); // re-derive the kinematic params too
+  if (meta.locked) lockOrbit(state, G, index, currentStep); // re-derive the kinematic params too
   return { index, ...meta };
 }
 
-function lockOrbit(state, G, index) {
+// Locks a body into a circular orbit at its CURRENT radius, exerting
+// gravity as always but never integrated - same kinematic mechanism the
+// pinned core/moons already use (see step()'s locked-orbit block).
+//
+// Two things this deliberately does NOT do, both found by testing against
+// the actual running sim rather than assumed correct on paper:
+//
+// 1. It does NOT freeze the body's current (possibly non-circular)
+//    velocity as the locked speed. A body can easily be off a clean
+//    circular path the moment it's locked - ordinary N-body drift (already
+//    documented elsewhere in this file), or it was just created/mass-
+//    edited - so "whatever speed it has right now" isn't reliably a
+//    circular orbit. `angularSpeed` is instead derived straight from
+//    G/hostMass/radius (the same formula circularOrbitVelocity() uses),
+//    guaranteeing a true circle regardless of how it was moving before.
+//
+// 2. It does NOT let step()'s kinematic formula use `stepCount` directly
+//    as elapsed time. `phase0` is the body's real angle *right now*, but
+//    stepCount keeps counting from simulation start, not from this lock -
+//    using it unadjusted made the body SNAP to a essentially arbitrary
+//    angle the instant it locked (a jump of `angularSpeed * stepCount *
+//    DT` radians, worse the longer the session had already been running,
+//    and repeating on every re-lock e.g. after recalcOrbit) - which is
+//    exactly what read as "not orbiting" even though the geometry/math was
+//    otherwise correct. Stashing `lockedAtStep` here lets step() compute
+//    elapsed time as `(stepCount - lockedAtStep) * DT` instead, so `angle
+//    === phase0` at the exact moment of locking - zero discontinuity.
+function lockOrbit(state, G, index, currentStep) {
   const meta = state.systemMeta[index];
   if (!meta) return null;
   const hostIdx = meta.hostIndex;
   const hostX = state.x[hostIdx], hostY = state.y[hostIdx];
-  const hostVX = state.vx[hostIdx], hostVY = state.vy[hostIdx];
+  const hostMass = state.mass[hostIdx];
   const dx = state.x[index] - hostX, dy = state.y[index] - hostY;
   const radius = Math.max(MIN_PLACEMENT_RADIUS, Math.hypot(dx, dy));
-  const speed = Math.hypot(state.vx[index] - hostVX, state.vy[index] - hostVY);
+  const angularSpeed = Math.sqrt((G * hostMass) / radius) / radius;
   meta.locked = true;
   state.lockedOrbit[index] = {
-    radius, angularSpeed: speed / radius, phase0: Math.atan2(dy, dx), hostIndex: hostIdx,
+    radius, angularSpeed, phase0: Math.atan2(dy, dx), hostIndex: hostIdx,
+    lockedAtStep: currentStep || 0,
   };
   return { index, ...meta };
 }

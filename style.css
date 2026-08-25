@@ -232,14 +232,36 @@ input[type="number"]:focus {
 #modeIndicator.mode-system:hover {
   background: rgba(95, 214, 138, 0.26);
 }
+#modeIndicator.mode-cosmic {
+  color: #ffd24d;
+  background: rgba(255, 210, 77, 0.14);
+  border: 1px solid rgba(255, 210, 77, 0.3);
+}
 
 #backToGalaxyBtn {
-  border-color: rgba(95, 214, 138, 0.35);
-  background: rgba(20, 40, 30, 0.75);
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  z-index: 6;
+  padding: 8px 14px;
+  font-size: 12.5px;
+  font-weight: 600;
+  border-radius: 8px;
+  border: 1px solid rgba(95, 214, 138, 0.35);
+  background: rgba(20, 40, 30, 0.8);
   color: #7be8a8;
+  cursor: pointer;
+  backdrop-filter: blur(8px);
+  transition: background 0.15s ease;
 }
 #backToGalaxyBtn:hover {
   background: rgba(95, 214, 138, 0.22);
+}
+/* Push the info panel down whenever the back button is showing (system or
+   galaxy mode - both now use it, unlike the old 2-tier design where it was
+   system-mode-only), so the two fixed top-right elements never overlap. */
+body:has(#backToGalaxyBtn:not(.hidden)) #info-panel {
+  top: 62px;
 }
 
 /* --- System-view toolbar & status line (Interactive Gameplay Expansion) ---
@@ -356,6 +378,96 @@ body.creation-mode #sim-canvas {
   background: rgba(110, 130, 240, 0.32);
 }
 #ctxDelete {
+  color: #ff9c8f;
+}
+
+/* --- Cosmic Web Sandbox: toolbar/status/context menu - mirrors
+   #systemHud/#systemToolbar/#statusLine/#contextMenu's exact structure and
+   visual language one level up (same reasoning: one positioned flex-column
+   wrapper instead of independently-guessed pixel offsets), shown only in
+   cosmic mode instead of system mode. */
+#cosmicHud {
+  position: fixed;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+body.cosmic-mode #cosmicHud {
+  display: flex;
+}
+#cosmicToolbar {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  max-width: min(640px, calc(100vw - 32px));
+  padding: 8px;
+  background: rgba(12, 14, 30, 0.72);
+  border: 1px solid rgba(140, 160, 255, 0.18);
+  border-radius: 12px;
+  backdrop-filter: blur(8px);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.4);
+}
+#cosmicToolbar button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+#cosmicToolbar button.active {
+  background: rgba(255, 210, 77, 0.28);
+  border-color: rgba(255, 210, 77, 0.55);
+  color: #fff3d1;
+}
+#cosmicStatusLine {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+  border-radius: 20px;
+  background: rgba(12, 14, 30, 0.72);
+  border: 1px solid rgba(140, 160, 255, 0.18);
+  color: #c3c8f2;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  backdrop-filter: blur(8px);
+  user-select: none;
+}
+#cosmicStatusLine span {
+  color: #eef0ff;
+  font-weight: 600;
+}
+#mergeSelectionStatus {
+  color: #ffd24d !important;
+}
+#galaxyContextMenu {
+  position: fixed;
+  z-index: 15;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 5px;
+  background: rgba(12, 14, 30, 0.94);
+  border: 1px solid rgba(140, 160, 255, 0.25);
+  border-radius: 8px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+}
+#galaxyContextMenu button {
+  flex: 1;
+  text-align: left;
+  padding: 6px 10px;
+  font-size: 12px;
+  background: transparent;
+  border: none;
+  border-radius: 5px;
+}
+#galaxyContextMenu button:hover {
+  background: rgba(110, 130, 240, 0.32);
+}
+#ctxGalaxyDelete {
   color: #ff9c8f;
 }
 

@@ -35,9 +35,19 @@ class Renderer {
     this.starType = null;    // per-index raw type code (for hit-test/info lookups)
     this.alive = null;       // Uint8Array mirror of worker's alive flags, for skipping dead bodies
 
-    this.mode = 'galaxy';    // 'galaxy' | 'system' - purely a render-time flag
+    this.mode = 'galaxy';    // 'cosmic' | 'galaxy' | 'system' - purely a render-time flag
     this.focusIndex = -1;    // index of the star being zoomed into, in system mode
     this.systemMeta = {};    // slot index -> planet metadata (orbitRadius, moons, ...)
+
+    // Cosmic mode: index in the cosmic-layer positions buffer -> galaxy
+    // metadata (name/mass/morphology/starCount), parallel to systemMeta one
+    // level down. selectedGalaxyId is a stable galaxy id (not a buffer
+    // index - those shift as galaxies are created/deleted), matching how
+    // system bodies are addressed by worker-assigned index but this cosmic
+    // layer's own records carry a separate persistent `id`.
+    this.cosmicMeta = [];        // [{id, name, mass, morphology, starCount}], buffer-index-aligned
+    this.selectedGalaxyId = -1;
+    this._cosmicTrails = new Map(); // galaxyId -> [{x,y}, ...] ring buffer of recent positions
 
     this.selectedIndex = -1; // currently-selected body (set by main.js) - drawn with a selection ring
     this._newFlashes = [];   // [{index, born, duration}] - new-body glow fade, reads live position
@@ -95,7 +105,8 @@ class Renderer {
       e.preventDefault();
       const factor = Math.exp(-e.deltaY * 0.001);
       const before = this.screenToWorld(e.offsetX, e.offsetY);
-      this.camera.zoom = Math.min(20, Math.max(0.02, this.camera.zoom * factor));
+      const [zMin, zMax] = this._zoomRange();
+      this.camera.zoom = Math.min(zMax, Math.max(zMin, this.camera.zoom * factor));
       const after = this.screenToWorld(e.offsetX, e.offsetY);
       // Keep the point under the cursor stationary while zooming.
       this.camera.x += before.x - after.x;
@@ -137,6 +148,20 @@ class Renderer {
     canvas.addEventListener('pointerleave', () => {
       if (this.onHover) this.onHover(-1, -1); // hide tooltip
     });
+  }
+
+  // Mode-aware zoom bounds. Framing the 100,000-unit cosmic plane in a
+  // ~1000px viewport needs zoom~=0.008-0.01, below the galaxy/system range's
+  // 0.02 floor - and a max well below where individual galaxy stars would
+  // need to render (a galaxy dot should never grow large enough to look
+  // like it should show internal structure; entering a galaxy is always an
+  // explicit "Enter Galaxy ->" action, never an implicit scroll-zoom-in).
+  // Checked in BOTH the wheel handler and after every tween/direct camera
+  // write (_updateTween, resetCamera) - panZoomTo itself sets camera.zoom
+  // with no bound at all, so a tween landing outside this mode's range
+  // would otherwise pop back the instant the user first scrolled.
+  _zoomRange() {
+    return this.mode === 'cosmic' ? [0.005, 1.5] : [0.02, 20];
   }
 
   screenToWorld(sx, sy) {
@@ -193,7 +218,9 @@ class Renderer {
     const eased = t * t * (3 - 2 * t); // smoothstep
     this.camera.x = this.tween.fromX + (this.tween.targetX - this.tween.fromX) * eased;
     this.camera.y = this.tween.fromY + (this.tween.targetY - this.tween.fromY) * eased;
-    this.camera.zoom = this.tween.fromZoom + (this.tween.targetZoom - this.tween.fromZoom) * eased;
+    const [zMin, zMax] = this._zoomRange();
+    this.camera.zoom = Math.min(zMax, Math.max(zMin,
+      this.tween.fromZoom + (this.tween.targetZoom - this.tween.fromZoom) * eased));
     if (t >= 1) {
       const done = this.tween.onDone;
       this.tween = null;
@@ -291,6 +318,21 @@ class Renderer {
     this.systemMeta = {};
   }
 
+  // Cosmic mode's equivalent of setStarMeta/setSystemMeta - `galaxies` is
+  // buffer-index-aligned with the cosmicPositions message (same order
+  // main.js already keeps a copy in, since cosmicBodyDelta/cosmicReady both
+  // send the full current list). Also records a trail sample per galaxy
+  // (see _drawCosmic) - the existing global canvas-fade trail effect is
+  // imperceptible at cosmic-orbit speeds, so this per-galaxy history is a
+  // distinct, necessary mechanism, not a duplicate of that one.
+  setCosmicMeta(galaxies) {
+    this.cosmicMeta = galaxies;
+    const stillTracked = new Set(galaxies.map((g) => g.id));
+    for (const id of this._cosmicTrails.keys()) {
+      if (!stillTracked.has(id)) this._cosmicTrails.delete(id);
+    }
+  }
+
   // --- Hit-testing (shared by click and hover) ---
 
   findBodyAt(positions, n, sx, sy, thresholdPx = 16) {
@@ -304,6 +346,21 @@ class Renderer {
       if (d < bestDist) { bestDist = d; best = i; }
     }
     return best;
+  }
+
+  // Cosmic mode's hit-test - returns a galaxy id (not a buffer index, which
+  // shifts across create/delete), or -1. A slightly larger default
+  // threshold than findBodyAt's: galaxy dots are meant to be easy targets
+  // at a zoomed-way-out scale, not precision click targets.
+  findGalaxyAt(cosmicPositions, n, sx, sy, thresholdPx = 20) {
+    if (!cosmicPositions) return -1;
+    let best = -1, bestDist = thresholdPx;
+    for (let i = 0; i < n; i++) {
+      const p = this.worldToScreen(cosmicPositions[i * 2], cosmicPositions[i * 2 + 1]);
+      const d = Math.hypot(p.x - sx, p.y - sy);
+      if (d < bestDist) { bestDist = d; best = i; }
+    }
+    return best === -1 ? -1 : (this.cosmicMeta[best] ? this.cosmicMeta[best].id : -1);
   }
 
   _moonWorldPos(planetX, planetY, moon, simStep) {
@@ -407,10 +464,107 @@ class Renderer {
     ctx.globalAlpha = 1;
   }
 
+  // --- Cosmic-scale draw (galaxies as glowing dots + fading trails) ---
+  // Entirely separate from the star-level draw() below: different buffer
+  // (cosmicPositions, not positions), different visual language (dots
+  // colored/sized by galaxy morphology/mass, not spectral type), and no
+  // shared per-body metadata with the star-level arrays at all.
+  _drawCosmic(cosmicPositions, n, now) {
+    const { ctx, canvas, camera, dpr } = this;
+    const w = canvas.width, h = canvas.height;
+    const cx = w / 2, cy = h / 2;
+    const zoom = camera.zoom * dpr;
+
+    ctx.fillStyle = 'rgba(4, 5, 14, 0.4)';
+    ctx.fillRect(0, 0, w, h);
+    if (!cosmicPositions) return;
+
+    const morphColors = (typeof GALAXY_MORPHOLOGY_COLORS !== 'undefined') ? GALAXY_MORPHOLOGY_COLORS : {};
+    const TRAIL_LENGTH = 30;
+
+    for (let i = 0; i < n; i++) {
+      const meta = this.cosmicMeta[i];
+      if (!meta) continue;
+      const wx = cosmicPositions[i * 2], wy = cosmicPositions[i * 2 + 1];
+
+      // Trail: a short ring buffer of recent positions per galaxy id,
+      // drawn as a fading polyline before the dot itself.
+      let trail = this._cosmicTrails.get(meta.id);
+      if (!trail) { trail = []; this._cosmicTrails.set(meta.id, trail); }
+      if (trail.length === 0 || trail[trail.length - 1].x !== wx || trail[trail.length - 1].y !== wy) {
+        trail.push({ x: wx, y: wy });
+        if (trail.length > TRAIL_LENGTH) trail.shift();
+      }
+
+      const sx = cx + (wx - camera.x) * zoom, sy = cy + (wy - camera.y) * zoom;
+      if (sx < -50 || sx > w + 50 || sy < -50 || sy > h + 50) continue;
+
+      if (trail.length > 1) {
+        ctx.beginPath();
+        for (let t = 0; t < trail.length; t++) {
+          const p = trail[t];
+          const tsx = cx + (p.x - camera.x) * zoom, tsy = cy + (p.y - camera.y) * zoom;
+          if (t === 0) ctx.moveTo(tsx, tsy); else ctx.lineTo(tsx, tsy);
+        }
+        const color = morphColors[meta.morphology] || '#a6c0ff';
+        ctx.strokeStyle = color;
+        ctx.globalAlpha = 0.22;
+        ctx.lineWidth = Math.max(1, 1.2 * dpr);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+
+      const color = morphColors[meta.morphology] || '#a6c0ff';
+      // Mass -> dot size, sqrt curve so the range (8e4-4e5, plus merged
+      // galaxies well above that) doesn't produce wildly mismatched sizes.
+      const r = Math.max(3, Math.sqrt(meta.mass) * 0.02) * dpr;
+
+      const grad = ctx.createRadialGradient(sx, sy, 0, sx, sy, r * 3.2);
+      grad.addColorStop(0, color);
+      grad.addColorStop(0.4, color);
+      grad.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(sx, sy, r * 3.2, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(sx, sy, r, 0, Math.PI * 2);
+      ctx.fill();
+
+      if (meta.id === this.selectedGalaxyId) {
+        ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+        ctx.lineWidth = Math.max(1, 1.5 * dpr);
+        ctx.beginPath();
+        ctx.arc(sx, sy, r + 5 * dpr, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+
+      // Name label - only once zoomed in enough that labels wouldn't
+      // completely overlap at typical galaxy spacing.
+      if (camera.zoom > 0.02) {
+        ctx.font = `${11 * dpr}px sans-serif`;
+        ctx.textBaseline = 'top';
+        ctx.fillStyle = 'rgba(220,225,255,0.85)';
+        ctx.fillText(meta.name, sx + r + 4 * dpr, sy - 5 * dpr);
+      }
+    }
+  }
+
   // --- Main draw ---
 
   draw(positions, n, now, simStep) {
     now = now ?? performance.now();
+    if (this.mode === 'cosmic') {
+      const dtSecCosmic = this._lastFrameTime == null ? 0 : Math.min(0.05, (now - this._lastFrameTime) / 1000);
+      this._updateTween(now);
+      this._drawCosmic(positions, n, now);
+      this._updateParticles(now, dtSecCosmic); // e.g. the "Collision" flourish burst
+      this._drawParticles(now);
+      this._lastFrameTime = now;
+      return;
+    }
     const dtSec = this._lastFrameTime == null ? 0 : Math.min(0.05, (now - this._lastFrameTime) / 1000);
     this._lastFrameTime = now;
     this._updateTween(now);

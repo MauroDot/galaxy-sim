@@ -22,12 +22,18 @@
 // function a test harness can call directly.
 
 if (typeof importScripts !== 'undefined') {
-  importScripts('quadtree.js', 'star-types.js', 'galaxy.js', 'system-bodies.js', 'system-editor.js');
+  importScripts(
+    'quadtree.js', 'star-types.js', 'galaxy.js', 'galaxy-morphology.js',
+    'cosmic-web.js', 'cosmic-editor.js', 'system-bodies.js', 'system-editor.js'
+  );
 } else {
   // Node/CommonJS test-harness path only.
   Object.assign(globalThis, require('./quadtree.js'));
   Object.assign(globalThis, require('./star-types.js'));
   Object.assign(globalThis, require('./galaxy.js'));
+  Object.assign(globalThis, require('./galaxy-morphology.js'));
+  Object.assign(globalThis, require('./cosmic-web.js'));
+  Object.assign(globalThis, require('./cosmic-editor.js'));
   Object.assign(globalThis, require('./system-bodies.js'));
   Object.assign(globalThis, require('./system-editor.js'));
 }
@@ -78,6 +84,19 @@ let speed = 1;
 let acc = 0;
 let timer = null;
 let stepCount = 0;
+
+// Cosmic Web Sandbox: a second, much lighter simulation layer alongside
+// `state` above, not instead of it - see cosmic-web.js's header comment for
+// why coordinate frames are never unified between the two. `cosmicState` is
+// null until a universe is actually initialized (init still boots straight
+// into a single galaxy's `state` the way it always has, for anyone testing
+// just the galaxy/system layers in isolation - `initCosmic` is a separate,
+// additional message). `loadedGalaxyId` tracks which cosmic-layer galaxy
+// (if any) currently has its star-level `state` loaded, mirroring the
+// system layer's `state.focusIndex === -1` "nothing loaded" convention.
+let cosmicState = null;  // { galaxies, centers, filaments, undoStack, nextCustomId } | null
+let loadedGalaxyId = -1;
+let cosmicG = DEFAULT_G; // scaled by the same Crazy Physics/Low Gravity toggles as the galaxy-layer G
 
 function buildTree(s) {
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
@@ -136,13 +155,17 @@ function step(s) {
   // Locked-orbit kinematic override: position/velocity recomputed directly
   // from stored orbital parameters (same formula moons already use, applied
   // here to a REAL body) rather than integrated - "Lock Orbit" freezes a
-  // body into a circular path even if its mass later changes.
+  // body into a circular path even if its mass later changes. Elapsed time
+  // is measured from `lockedAtStep` (when this lock was established), NOT
+  // from simulation start - using stepCount directly here made the body
+  // snap to an arbitrary angle the instant it locked (see lockOrbit()'s
+  // comment in system-editor.js for the full story of that bug).
   for (const idxStr in s.lockedOrbit) {
     const idx = Number(idxStr);
     if (!s.alive[idx]) { delete s.lockedOrbit[idx]; continue; }
     const lock = s.lockedOrbit[idx];
     const hostIdx = lock.hostIndex;
-    const t = stepCount * DT;
+    const t = (stepCount - (lock.lockedAtStep || 0)) * DT;
     const angle = lock.phase0 + lock.angularSpeed * t;
     s.x[idx] = s.x[hostIdx] + Math.cos(angle) * lock.radius;
     s.y[idx] = s.y[hostIdx] + Math.sin(angle) * lock.radius;
@@ -248,7 +271,12 @@ function initSim(newSeed, newNumStars, newParams) {
   numStars = newNumStars;
   params = newParams || {};
   G = DEFAULT_G; // "System Experiments" toggles reset on reload/regen
-  const g = generateGalaxy(seed, numStars, params);
+  // generateGalaxyByMorphology falls through to the untouched
+  // generateGalaxy() (spiral) whenever params.morphology is unset or
+  // invalid - the top-level "one galaxy" boot path (no morphology param)
+  // behaves byte-for-byte as it always has. Cosmic Web Sandbox's
+  // enterGalaxy() below is the only caller that ever passes a morphology.
+  const g = generateGalaxyByMorphology(seed, numStars, params);
 
   // Capacity model: allocate room for SYSTEM_POOL_CAPACITY reserved,
   // dormant "system body" slots after the real galaxy bodies. buildTree()/
@@ -324,6 +352,117 @@ function initSim(newSeed, newNumStars, newParams) {
   postPositions();
 }
 
+// --- Cosmic Web Sandbox ---
+
+function publicGalaxyView(g) {
+  return {
+    id: g.id, name: g.name, x: g.x, y: g.y, mass: g.mass,
+    morphology: g.morphology, starCount: g.starCount,
+  };
+}
+
+function initCosmic(universeSeed, opts) {
+  const universe = generateUniverse(universeSeed, opts || {});
+  cosmicState = {
+    seed: universeSeed,
+    galaxies: universe.galaxies,
+    centers: universe.centers,
+    filaments: universe.filaments,
+    undoStack: [],
+    nextCustomId: universe.galaxies.length,
+  };
+  loadedGalaxyId = -1;
+  cosmicG = DEFAULT_G;
+  postCosmicPositions();
+  emit({
+    type: 'cosmicReady',
+    seed: universeSeed,
+    galaxies: cosmicState.galaxies.map(publicGalaxyView),
+  });
+}
+
+// Loads a shared universe from a decoded `?universe=` payload (see
+// universe-codec.js, main-thread-only - decoding happens there, this just
+// installs the already-decoded galaxy list). A full snapshot, not
+// seed+diff - same "?system= is a full snapshot too" precedent - so there's
+// no procedural regeneration step here at all, unlike initCosmic().
+function loadUniverse(payload) {
+  cosmicState = {
+    seed: 'shared', // no real seed to derive per-galaxy state from - see enterGalaxy's derivedSeed fallback below
+    galaxies: payload.galaxies,
+    centers: [],
+    filaments: [],
+    undoStack: [],
+    nextCustomId: payload.galaxies.length,
+  };
+  loadedGalaxyId = -1;
+  cosmicG = DEFAULT_G;
+  postCosmicPositions();
+  emit({
+    type: 'cosmicReady',
+    seed: null,
+    fromShare: true,
+    galaxies: cosmicState.galaxies.map(publicGalaxyView),
+  });
+}
+
+// Loads a cosmic-layer galaxy's own star-level `state` on demand, mirroring
+// enterSystem()'s generate-or-restore pattern one level up. `saved` (if
+// provided) is a persisted per-galaxy system-editor snapshot passed through
+// unchanged to `enterSystem`-style restoration - see main.js's persistence
+// layer, which keys these the same way per-star system saves always have,
+// just with a per-galaxy derived seed instead of the app's single global
+// seed. The derived seed (`${universeSeed}:galaxy:${galaxyId}`) is never
+// itself stored - recomputed the same way every time, same principle as
+// `${seed}:system:${starIndex}` already being derived, not stored.
+function enterGalaxy(galaxyId) {
+  if (!cosmicState) return;
+  const g = cosmicState.galaxies.find((gal) => gal.id === galaxyId);
+  if (!g) return;
+  if (loadedGalaxyId === galaxyId && state) {
+    // Already the active galaxy - nothing to regenerate.
+    emit({ type: 'galaxyEntered', galaxyId, name: g.name, morphology: g.morphology, wasGenerated: false });
+    return;
+  }
+  const derivedSeed = `${cosmicState.seed}:galaxy:${galaxyId}`;
+  initSim(derivedSeed, g.starCount, { morphology: g.morphology });
+  loadedGalaxyId = galaxyId;
+  emit({ type: 'galaxyEntered', galaxyId, name: g.name, morphology: g.morphology, wasGenerated: true });
+}
+
+// Discards the currently-loaded galaxy's star-level state entirely (unlike
+// evictSystem(), which clears bodies from a still-live `state` - here the
+// whole per-galaxy `state` object stops existing, since only one galaxy's
+// stars are ever meant to be simulated at a time per the perf budget).
+// Cosmic-layer motion is unaffected - `cosmicState` keeps stepping in
+// tick() regardless of whether any galaxy is loaded.
+function exitGalaxy() {
+  state = null;
+  loadedGalaxyId = -1;
+}
+
+// Mirrors broadcastSystemDelta() one level up: every cosmic-editor mutating
+// action replies with the full current galaxy list (cheap at this scale -
+// at most ~100 records) rather than a diff, same "wholesale resync is
+// simpler and more robust" reasoning already used for system bodies.
+function broadcastCosmicDelta(action, result) {
+  if (cosmicState) postCosmicPositions();
+  emit({
+    type: 'cosmicBodyDelta',
+    action, result,
+    galaxies: cosmicState ? cosmicState.galaxies.map(publicGalaxyView) : [],
+  });
+}
+
+// A cosmic-layer mutation (delete/merge/collision) targeting the currently-
+// loaded galaxy must evict its star-level state first - mirrors the
+// existing evictSystem()-before-enterSystem() invariant one level up, or a
+// stale `state` would silently keep consuming capacity for a galaxy that
+// no longer exists in cosmicState.
+function evictLoadedGalaxyIfTargeted(galaxyIds) {
+  if (loadedGalaxyId !== -1 && galaxyIds.includes(loadedGalaxyId)) exitGalaxy();
+}
+
 function postPositions() {
   const n = state.n;
   const buf = new Float32Array(n * 2);
@@ -334,8 +473,26 @@ function postPositions() {
   emit({ type: 'positions', n, step: stepCount, buf }, [buf.buffer]);
 }
 
+// Parallel to postPositions() above, but for the much smaller cosmic-layer
+// galaxy list - sent every tick the cosmic layer actually steps, same as
+// per-galaxy star positions. Per-galaxy metadata (name/mass/morphology/
+// starCount) is NOT resent here - that only changes on a mutating cosmic
+// action and is already covered by the systemBodyDelta-equivalent broadcast
+// those actions send (see cosmic-editor.js wiring below).
+function postCosmicPositions() {
+  const galaxies = cosmicState.galaxies;
+  const n = galaxies.length;
+  const buf = new Float32Array(n * 2);
+  for (let i = 0; i < n; i++) {
+    buf[i * 2] = galaxies[i].x;
+    buf[i * 2 + 1] = galaxies[i].y;
+  }
+  emit({ type: 'cosmicPositions', n, step: stepCount, buf }, [buf.buffer]);
+}
+
 function tick() {
-  if (!playing || !state) return;
+  if (!playing) return;
+  if (!state && !cosmicState) return;
   acc += speed;
   let stepped = false;
   const allDied = [];
@@ -346,17 +503,40 @@ function tick() {
   // Cap substeps per tick so a runaway speed value can't stall the worker.
   let guard = 0;
   while (acc >= 1 && guard < 240) {
-    const { died, absorbed, coreAbsorptions, collisions, absorbedSystemBody } = step(state);
-    if (died.length) allDied.push(...died);
-    if (absorbed.length) allAbsorbed.push(...absorbed);
-    if (coreAbsorptions.length) allCoreAbsorptions.push(...coreAbsorptions);
-    if (collisions.length) allCollisions.push(...collisions);
-    if (absorbedSystemBody) anySystemBodyAbsorbed = true;
+    if (state) {
+      // step(state) increments stepCount itself (also relied on by the
+      // Node test harness calling _step() directly, bypassing tick()
+      // entirely) - don't double-increment it here too.
+      const { died, absorbed, coreAbsorptions, collisions, absorbedSystemBody } = step(state);
+      if (died.length) allDied.push(...died);
+      if (absorbed.length) allAbsorbed.push(...absorbed);
+      if (coreAbsorptions.length) allCoreAbsorptions.push(...coreAbsorptions);
+      if (collisions.length) allCollisions.push(...collisions);
+      if (absorbedSystemBody) anySystemBodyAbsorbed = true;
+    } else {
+      // No galaxy loaded (pure cosmic view) - step(state) never runs, so
+      // nothing else advances stepCount even though cosmicStep() below is
+      // genuinely stepping every substep. Without this, postCosmicPositions'
+      // reported `step` value stays frozen at 0 forever in cosmic view,
+      // and the UI's "Physics Hz" stat (derived from consecutive step
+      // values) reads a permanent 0 despite the simulation actually
+      // running correctly (found empirically - positions do move, only
+      // the reported step count didn't).
+      stepCount++;
+    }
+    // Cosmic-layer galaxies keep drifting/orbiting even while a specific
+    // galaxy is loaded and zoomed into - this is the SAME tick/accumulator,
+    // not a separate one, so both layers share play/pause/speed/Time Warp
+    // for free with no extra synchronization needed.
+    if (cosmicState) cosmicStep(cosmicState.galaxies, cosmicG, DT);
     acc -= 1;
     stepped = true;
     guard++;
   }
-  if (stepped) postPositions();
+  if (stepped) {
+    if (state) postPositions();
+    if (cosmicState) postCosmicPositions();
+  }
   for (const i of allDied) {
     emit({
       type: 'supernova',
@@ -484,7 +664,7 @@ function enterSystem(starIndex, saved) {
       Math.abs(saved.hostMass - hostMass) < 1e-6 && Array.isArray(saved.bodies)) {
     state.nextCustomIndex = saved.nextCustomIndex || 1;
     state.nextMoonId = saved.nextMoonId || 1;
-    restoreBodiesFromSnapshot(state, saved.bodies);
+    restoreBodiesFromSnapshot(state, saved.bodies, G, stepCount);
     wasGenerated = false;
   } else {
     const generated = generateSystem(seed, starIndex, hostMass, hostType).planets;
@@ -562,7 +742,7 @@ function loadSharedSystem(payload) {
       relVX: vx, relVY: vy,
     };
   });
-  restoreBodiesFromSnapshot(state, bodies);
+  restoreBodiesFromSnapshot(state, bodies, G, stepCount);
 
   postPositions();
   emit({
@@ -657,8 +837,86 @@ function handleMessage(msg) {
       break;
     }
     case 'setPhysicsParams':
-      if (typeof msg.G === 'number' && msg.G > 0) G = msg.G;
+      // Crazy Physics/Low Gravity scale the cosmic layer's G by the same
+      // ratio, not a separately-set value - this is a whole-simulation
+      // effect by design (see star-types.js's DEFAULT_G comment), not a
+      // special case for just the currently-loaded galaxy/system.
+      if (typeof msg.G === 'number' && msg.G > 0) {
+        cosmicG = cosmicG * (msg.G / G);
+        G = msg.G;
+      }
       break;
+    case 'initCosmic':
+      initCosmic(msg.seed, msg.opts);
+      break;
+    case 'loadUniverse':
+      loadUniverse(msg.payload);
+      break;
+    case 'enterGalaxy':
+      enterGalaxy(msg.galaxyId);
+      break;
+    case 'exitGalaxy':
+      exitGalaxy();
+      break;
+    case 'createGalaxy': {
+      if (!cosmicState) break;
+      pushCosmicUndoSnapshot(cosmicState);
+      const result = createGalaxy(cosmicState, msg.x, msg.y, msg.morphology);
+      broadcastCosmicDelta('createGalaxy', result);
+      break;
+    }
+    case 'deleteGalaxy': {
+      if (!cosmicState) break;
+      pushCosmicUndoSnapshot(cosmicState);
+      evictLoadedGalaxyIfTargeted([msg.galaxyId]);
+      const result = deleteGalaxy(cosmicState, msg.galaxyId);
+      broadcastCosmicDelta('deleteGalaxy', result);
+      break;
+    }
+    case 'renameGalaxy': {
+      if (!cosmicState) break;
+      pushCosmicUndoSnapshot(cosmicState);
+      const result = renameGalaxy(cosmicState, msg.galaxyId, msg.name);
+      broadcastCosmicDelta('renameGalaxy', result);
+      break;
+    }
+    case 'changeGalaxyType': {
+      if (!cosmicState) break;
+      pushCosmicUndoSnapshot(cosmicState);
+      evictLoadedGalaxyIfTargeted([msg.galaxyId]); // a loaded galaxy's stars were generated for its OLD morphology
+      const result = changeGalaxyType(cosmicState, msg.galaxyId, msg.morphology);
+      broadcastCosmicDelta('changeGalaxyType', result);
+      break;
+    }
+    case 'adjustGalaxyMass': {
+      if (!cosmicState) break;
+      pushCosmicUndoSnapshot(cosmicState);
+      const result = adjustGalaxyMass(cosmicState, msg.galaxyId, msg.multiplier);
+      broadcastCosmicDelta('adjustGalaxyMass', result);
+      break;
+    }
+    case 'mergeGalaxies':
+    case 'collideGalaxies': {
+      if (!cosmicState) break;
+      pushCosmicUndoSnapshot(cosmicState);
+      evictLoadedGalaxyIfTargeted([msg.idA, msg.idB]);
+      const result = mergeGalaxies(cosmicState, msg.idA, msg.idB);
+      // "Collision" is the same underlying merge as "Merge Galaxies", plus
+      // a cosmetic flourish event main.js reacts to with a particle burst/
+      // wobble before settling - no real dual-galaxy star-level physics,
+      // an explicit scope decision (see the Cosmic Web Sandbox plan).
+      if (result && msg.type === 'collideGalaxies') {
+        emit({ type: 'galaxyCollision', ...result });
+      }
+      broadcastCosmicDelta(msg.type, result);
+      break;
+    }
+    case 'undoCosmic': {
+      if (!cosmicState) break;
+      const ok = undoCosmic(cosmicState);
+      if (ok) broadcastCosmicDelta('undoCosmic', null);
+      break;
+    }
     case 'createPlanet': {
       if (state.focusIndex === -1) break;
       pushUndoSnapshot(state);
@@ -697,14 +955,14 @@ function handleMessage(msg) {
     case 'recalcOrbit': {
       if (state.focusIndex === -1) break;
       pushUndoSnapshot(state);
-      const result = recalcOrbit(state, G, msg.index);
+      const result = recalcOrbit(state, G, msg.index, stepCount);
       broadcastSystemDelta('recalcOrbit', result);
       break;
     }
     case 'lockOrbit': {
       if (state.focusIndex === -1) break;
       pushUndoSnapshot(state);
-      const result = msg.locked ? lockOrbit(state, G, msg.index) : unlockOrbit(state, msg.index);
+      const result = msg.locked ? lockOrbit(state, G, msg.index, stepCount) : unlockOrbit(state, msg.index);
       broadcastSystemDelta('lockOrbit', result);
       break;
     }
@@ -731,7 +989,7 @@ function handleMessage(msg) {
     }
     case 'undo': {
       if (state.focusIndex === -1) break;
-      const ok = undo(state);
+      const ok = undo(state, G, stepCount);
       if (ok) broadcastSystemDelta('undo', null);
       break;
     }
@@ -754,5 +1012,9 @@ if (typeof module !== 'undefined') {
     _getState: () => state,
     _getG: () => G,
     _step: () => step(state),
+    _getCosmicState: () => cosmicState,
+    _getCosmicG: () => cosmicG,
+    _getLoadedGalaxyId: () => loadedGalaxyId,
+    _cosmicStep: () => cosmicStep(cosmicState.galaxies, cosmicG, DT),
   };
 }

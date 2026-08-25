@@ -129,7 +129,17 @@ function decodeSystem(str) {
 if (typeof window !== 'undefined') {
   window.encodeSystem = encodeSystem;
   window.decodeSystem = decodeSystem;
+  // Exported too (not just used internally) so universe-codec.js's
+  // `?universe=` packed-binary codec can reuse the exact same base64url
+  // implementation instead of duplicating it - both are plain <script>
+  // tags sharing one global `window` scope, same as every worker-side file
+  // sharing one scope via importScripts.
+  window.base64UrlEncode = base64UrlEncode;
+  window.base64UrlDecode = base64UrlDecode;
 }
 if (typeof module !== 'undefined') {
-  module.exports = { encodeSystem, decodeSystem, BODY_KINDS, COMPOSITION_KEYS };
+  module.exports = {
+    encodeSystem, decodeSystem, BODY_KINDS, COMPOSITION_KEYS,
+    base64UrlEncode, base64UrlDecode,
+  };
 }

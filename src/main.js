@@ -89,6 +89,22 @@
     crazyPhysicsBtn: document.getElementById('crazyPhysicsBtn'),
     lowGravityBtn: document.getElementById('lowGravityBtn'),
     timeWarpBtn: document.getElementById('timeWarpBtn'),
+
+    cosmicToolbar: document.getElementById('cosmicToolbar'),
+    createGalaxyBtn: document.getElementById('createGalaxyBtn'),
+    mergeGalaxiesBtn: document.getElementById('mergeGalaxiesBtn'),
+    collideGalaxiesBtn: document.getElementById('collideGalaxiesBtn'),
+    undoCosmicBtn: document.getElementById('undoCosmicBtn'),
+    saveUniverseBtn: document.getElementById('saveUniverseBtn'),
+    cosmicStatusLine: document.getElementById('cosmicStatusLine'),
+    cosmicStatusCount: document.getElementById('cosmicStatusCount'),
+    mergeSelectionStatus: document.getElementById('mergeSelectionStatus'),
+
+    galaxyContextMenu: document.getElementById('galaxyContextMenu'),
+    ctxGalaxyMerge: document.getElementById('ctxGalaxyMerge'),
+    ctxGalaxyIncreaseMass: document.getElementById('ctxGalaxyIncreaseMass'),
+    ctxGalaxyChangeType: document.getElementById('ctxGalaxyChangeType'),
+    ctxGalaxyDelete: document.getElementById('ctxGalaxyDelete'),
   };
 
   let playing = true;
@@ -105,11 +121,23 @@
   let coreConsumedCount = 0; // black holes/quasars the core has eaten this session
 
   // --- Sol System zoom state ---
-  let mode = 'galaxy'; // 'galaxy' | 'system'
+  let mode = 'cosmic'; // 'cosmic' | 'galaxy' | 'system' - boots into cosmic per the Cosmic Web Sandbox spec
   let focusIndex = -1;
   let latestSystemSlots = [];
   let activeSeed = null;
   let autosaveTimer = null;
+
+  // --- Cosmic Web Sandbox state ---
+  let universeSeed = null;
+  let latestCosmicPositions = null;
+  let latestCosmicN = 0;
+  let latestCosmicMeta = []; // [{id,name,x,y,mass,morphology,starCount}], buffer-index-aligned
+  let selectedGalaxyId = -1;
+  let loadedGalaxyId = -1; // which galaxy (if any) currently has its star-level state loaded
+  let loadedFromUniverseShare = false;
+  let cosmicAutosaveTimer = null;
+  let mergeSelection = []; // up to 2 galaxy ids, for the "select two, then Merge/Collision" flow
+  let cosmicCreationMode = false; // "Create Galaxy" click-to-place, mirrors creationMode one level down
 
   // --- Interactive editor state ---
   let creationMode = null; // null | 'planet' | 'moon'
@@ -187,6 +215,17 @@
   function currentStarCount() {
     const v = parseInt(els.starCount.value, 10);
     return Number.isFinite(v) ? Math.min(3000, Math.max(10, v)) : 500;
+  }
+
+  // Repurposes the same input field (relabeled "Galaxies" in index.html)
+  // now that the app's top level is a universe, not a single galaxy - a
+  // single galaxy's own star count is no longer user-controlled at all,
+  // it comes from that galaxy's own cosmic-layer record (300-1000,
+  // generateUniverse's own range). Clamped to the spec's own stated
+  // "20-50 galaxies per universe" range.
+  function currentGalaxyCount() {
+    const v = parseInt(els.starCount.value, 10);
+    return Number.isFinite(v) ? Math.min(50, Math.max(20, v)) : 32;
   }
 
   function setPlaying(next) {
@@ -311,12 +350,23 @@
     renderer.mode = 'galaxy';
     renderer.focusIndex = -1;
     renderer.clearSystemMeta();
-    els.modeIndicator.textContent = 'Galaxy View';
+    // Every galaxy is always cosmic-sourced now (the app boots straight
+    // into cosmic view) - the back button stays visible in galaxy mode too,
+    // now meaning "back to cosmos" rather than being hidden as the old
+    // top-level state. galaxyLabel() falls back to a generic label if this
+    // is somehow called before a galaxyEntered message ever arrived.
+    els.modeIndicator.textContent = 'Galaxy View: ' + galaxyLabel();
     els.modeIndicator.classList.remove('mode-system');
     els.modeIndicator.classList.add('mode-galaxy');
-    els.backBtn.classList.add('hidden');
+    els.backBtn.classList.remove('hidden');
+    els.backBtn.textContent = '← Back to Cosmos';
     document.body.classList.remove('system-mode');
     stopAutosave();
+  }
+
+  function galaxyLabel() {
+    const g = latestCosmicMeta.find((gal) => gal.id === loadedGalaxyId);
+    return g ? g.name : 'Galaxy';
   }
 
   function startAutosave() {
@@ -349,6 +399,7 @@
     focusIndex = starIndex;
     mode = 'system';
     els.backBtn.classList.remove('hidden');
+    els.backBtn.textContent = '← Back to Galaxy';
     document.body.classList.add('system-mode');
     startAutosave();
   }
@@ -363,9 +414,267 @@
     worker.postMessage({ type: 'exitSystem' });
   }
 
-  els.backBtn.addEventListener('click', exitSystem);
-  els.modeIndicator.addEventListener('click', () => {
+  // Back always goes exactly one level up (system->galaxy, or
+  // galaxy->cosmic) - a direct system->cosmic skip would need coordinating
+  // two async worker round-trips (exitSystem's save-then-reset, then
+  // exitGalaxy) into one gesture; two clicks is simpler and matches the
+  // plan's explicit "cascades, never skips" transition table.
+  function handleBack() {
     if (mode === 'system') exitSystem();
+    else if (mode === 'galaxy') exitToCosmic();
+  }
+  els.backBtn.addEventListener('click', handleBack);
+  els.modeIndicator.addEventListener('click', () => {
+    if (mode !== 'cosmic') handleBack();
+  });
+
+  // --- Cosmic Web Sandbox ---
+
+  function universeStorageKey(seedVal) {
+    return `galaxysim:universe:${seedVal}`;
+  }
+  // Only the cosmic-layer summary (positions/velocities/mass/morphology/
+  // starCount/name for every galaxy) - never any galaxy's full star array,
+  // consistent with the perf/memory budget ("only the active galaxy is
+  // ever loaded"). Whichever individual galaxy(s) the user actually zoomed
+  // into and edited persist via the existing, unmodified per-derived-seed
+  // system storage - "restoring the whole universe" only ever means
+  // restoring what was ever actually loaded, the same guarantee that
+  // mechanism already provides today.
+  function loadSavedUniverse(seedVal) {
+    try {
+      const raw = localStorage.getItem(universeStorageKey(seedVal));
+      return raw ? JSON.parse(raw) : null;
+    } catch (err) {
+      return null;
+    }
+  }
+  function saveUniverseSnapshot() {
+    if (!universeSeed || loadedFromUniverseShare) return;
+    try {
+      localStorage.setItem(universeStorageKey(universeSeed), JSON.stringify({ galaxies: latestCosmicMeta }));
+    } catch (err) {
+      /* best-effort only */
+    }
+  }
+  function startCosmicAutosave() {
+    stopCosmicAutosave();
+    cosmicAutosaveTimer = setInterval(() => {
+      if (mode === 'cosmic' || loadedGalaxyId !== -1) saveUniverseSnapshot();
+    }, 30000); // spec: "every 30 seconds", coarser than the per-system 5s (a bigger, less URGENT payload)
+  }
+  function stopCosmicAutosave() {
+    if (cosmicAutosaveTimer) { clearInterval(cosmicAutosaveTimer); cosmicAutosaveTimer = null; }
+  }
+
+  function initUniverse(seedVal, opts) {
+    els.seed.value = seedVal;
+    universeSeed = seedVal;
+    loadedFromUniverseShare = false;
+    // Matches init()'s own reset - without it, the first post-boot FPS
+    // window diffs against a stale (possibly larger) step count from
+    // whatever ran before and briefly shows a wrong/negative Physics Hz.
+    lastStepSeen = -1;
+    physStepsAtLastFpsCheck = -1;
+    latestCosmicPositions = null;
+    latestCosmicN = 0;
+    latestCosmicMeta = [];
+    loadedGalaxyId = -1;
+    mode = 'cosmic';
+    renderer.mode = 'cosmic';
+    selectedGalaxyId = -1;
+    renderer.selectedGalaxyId = -1;
+    mergeSelection = [];
+    hideInfoPanel();
+    els.modeIndicator.textContent = 'Cosmic View';
+    els.modeIndicator.classList.remove('mode-galaxy', 'mode-system');
+    els.modeIndicator.classList.add('mode-cosmic');
+    els.backBtn.classList.add('hidden');
+    document.body.classList.remove('system-mode', 'creation-mode');
+    document.body.classList.add('cosmic-mode');
+    renderer.tween = null;
+    renderer.camera.x = 0;
+    renderer.camera.y = 0;
+    renderer.camera.zoom = 0.012; // frames roughly the whole 100,000-unit plane
+    worker.postMessage({ type: 'initCosmic', seed: seedVal, opts: opts || { galaxyCount: 32 } });
+    startCosmicAutosave();
+  }
+
+  // Cosmic<->galaxy is a HARD CUT, not a continuous tween: a galaxy's
+  // cosmic-plane position and its own star-level local frame (core always
+  // pinned at that galaxy's own (0,0)) are two unrelated origins by design
+  // - there's no continuous function between them. Phase 1 tweens the
+  // camera toward the target IN COSMIC COORDINATES (still rendering cosmic
+  // content) while the transition overlay pulses; phase 2, timed to the
+  // overlay's opaque peak, does a non-tweened swap of mode/camera/state
+  // underneath it. See the Cosmic Web Sandbox plan's Context section for
+  // the full reasoning.
+  const COSMIC_TRANSITION_MS = 900;
+  const COSMIC_TRANSITION_SWAP_DELAY = 450; // overlay's opaque peak, see pulseOverlay's own timing
+
+  function enterGalaxy(galaxyId) {
+    if (mode !== 'cosmic') return;
+    const idx = latestCosmicMeta.findIndex((g) => g.id === galaxyId);
+    if (idx === -1) return;
+    const meta = latestCosmicMeta[idx];
+    const gx = latestCosmicPositions ? latestCosmicPositions[idx * 2] : meta.x;
+    const gy = latestCosmicPositions ? latestCosmicPositions[idx * 2 + 1] : meta.y;
+    playWhoosh();
+    hideInfoPanel();
+    renderer.panZoomTo(gx, gy, 1.2, COSMIC_TRANSITION_MS); // phase 1: still cosmic content, tweened
+    pulseOverlay(COSMIC_TRANSITION_MS);
+    setTimeout(() => {
+      // Phase 2 (hard cut): swap mode/camera/state, no interpolation.
+      mode = 'galaxy';
+      renderer.mode = 'galaxy';
+      renderer.tween = null;
+      renderer.camera.x = 0;
+      renderer.camera.y = 0;
+      renderer.camera.zoom = 0.6; // the existing default galaxy zoom
+      document.body.classList.remove('cosmic-mode');
+      els.modeIndicator.textContent = 'Galaxy View: ' + meta.name;
+      els.modeIndicator.classList.remove('mode-cosmic');
+      els.modeIndicator.classList.add('mode-galaxy');
+      els.backBtn.classList.remove('hidden');
+      els.backBtn.textContent = '← Back to Cosmos';
+      stopCosmicAutosave();
+      worker.postMessage({ type: 'enterGalaxy', galaxyId });
+    }, COSMIC_TRANSITION_SWAP_DELAY);
+  }
+
+  function exitToCosmic() {
+    if (mode !== 'galaxy') return;
+    const galaxyIdBeingExited = loadedGalaxyId; // captured now, before the reset below runs
+    playWhoosh();
+    hideInfoPanel();
+    renderer.panZoomTo(0, 0, 0.05, COSMIC_TRANSITION_MS); // phase 1: pull back within the galaxy's own local frame
+    pulseOverlay(COSMIC_TRANSITION_MS);
+    setTimeout(() => {
+      worker.postMessage({ type: 'exitGalaxy' });
+      loadedGalaxyId = -1;
+      mode = 'cosmic';
+      renderer.mode = 'cosmic';
+      renderer.tween = null;
+      // Re-center on wherever this galaxy actually sits on the plane,
+      // rather than snapping back to the plane's center every time.
+      const idx = latestCosmicMeta.findIndex((g) => g.id === galaxyIdBeingExited);
+      if (idx >= 0 && latestCosmicPositions) {
+        renderer.camera.x = latestCosmicPositions[idx * 2];
+        renderer.camera.y = latestCosmicPositions[idx * 2 + 1];
+      }
+      renderer.camera.zoom = 0.012;
+      document.body.classList.add('cosmic-mode');
+      els.modeIndicator.textContent = 'Cosmic View';
+      els.modeIndicator.classList.remove('mode-galaxy');
+      els.modeIndicator.classList.add('mode-cosmic');
+      els.backBtn.classList.add('hidden');
+      startCosmicAutosave();
+      updateCosmicStatus();
+    }, COSMIC_TRANSITION_SWAP_DELAY);
+  }
+
+  function updateCosmicStatus() {
+    if (mode !== 'cosmic') return;
+    els.cosmicStatusCount.textContent = String(latestCosmicMeta.length);
+    els.mergeSelectionStatus.textContent = mergeSelection.length
+      ? `${mergeSelection.length}/2 selected for merge`
+      : '';
+  }
+
+  function randomMorphologyForCreate() {
+    return GALAXY_MORPHOLOGIES[Math.floor(Math.random() * GALAXY_MORPHOLOGIES.length)];
+  }
+
+  function enterCosmicCreationMode() {
+    if (mode !== 'cosmic') return;
+    cosmicCreationMode = !cosmicCreationMode;
+    document.body.classList.toggle('creation-mode', cosmicCreationMode);
+    els.createGalaxyBtn.classList.toggle('active', cosmicCreationMode);
+    els.creationStatus.textContent = cosmicCreationMode ? 'Click to place a new galaxy' : '';
+    els.creationStatus.classList.toggle('hidden', !cosmicCreationMode);
+  }
+  function exitCosmicCreationMode() {
+    cosmicCreationMode = false;
+    document.body.classList.remove('creation-mode');
+    els.createGalaxyBtn.classList.remove('active');
+    els.creationStatus.classList.add('hidden');
+  }
+
+  els.createGalaxyBtn.addEventListener('click', enterCosmicCreationMode);
+
+  // Merge/Collision: click Merge or Collision, then click two galaxies -
+  // the SAME two-click "select then act" flow Add Moon already uses one
+  // level down, applied to picking a pair instead of a single target.
+  let mergeSelectMode = null; // null | 'merge' | 'collide'
+  function beginMergeSelection(kind) {
+    if (mode !== 'cosmic') return;
+    mergeSelectMode = mergeSelectMode === kind ? null : kind;
+    mergeSelection = [];
+    els.mergeGalaxiesBtn.classList.toggle('active', mergeSelectMode === 'merge');
+    els.collideGalaxiesBtn.classList.toggle('active', mergeSelectMode === 'collide');
+    updateCosmicStatus();
+  }
+  els.mergeGalaxiesBtn.addEventListener('click', () => beginMergeSelection('merge'));
+  els.collideGalaxiesBtn.addEventListener('click', () => beginMergeSelection('collide'));
+
+  els.undoCosmicBtn.addEventListener('click', () => {
+    if (mode === 'cosmic') worker.postMessage({ type: 'undoCosmic' });
+  });
+
+  els.saveUniverseBtn.addEventListener('click', () => {
+    if (mode !== 'cosmic' || !universeSeed) return;
+    const encoded = encodeUniverse({ galaxies: latestCosmicMeta });
+    const url = `${location.origin}${location.pathname}?universe=${encoded}`;
+    els.shareUrlInput.value = url;
+    els.shareDialog.classList.remove('hidden');
+  });
+
+  // --- Galaxy right-click context menu ---
+
+  function hideGalaxyContextMenu() {
+    els.galaxyContextMenu.classList.add('hidden');
+  }
+  let contextGalaxyId = -1;
+  function showGalaxyContextMenu(clientX, clientY, galaxyId) {
+    contextGalaxyId = galaxyId;
+    els.galaxyContextMenu.style.left = clientX + 'px';
+    els.galaxyContextMenu.style.top = clientY + 'px';
+    els.galaxyContextMenu.classList.remove('hidden');
+  }
+  canvas.addEventListener('contextmenu', (e) => {
+    if (mode !== 'cosmic') return;
+    e.preventDefault();
+    const galaxyId = renderer.findGalaxyAt(latestCosmicPositions, latestCosmicN, e.offsetX, e.offsetY, 20);
+    if (galaxyId >= 0) {
+      selectGalaxy(galaxyId);
+      showGalaxyContextMenu(e.clientX, e.clientY, galaxyId);
+    } else {
+      hideGalaxyContextMenu();
+    }
+  });
+  window.addEventListener('click', (e) => {
+    if (!els.galaxyContextMenu.contains(e.target)) hideGalaxyContextMenu();
+  });
+  els.ctxGalaxyIncreaseMass.addEventListener('click', () => {
+    if (contextGalaxyId >= 0) worker.postMessage({ type: 'adjustGalaxyMass', galaxyId: contextGalaxyId, multiplier: 1.5 });
+    hideGalaxyContextMenu();
+  });
+  els.ctxGalaxyChangeType.addEventListener('click', () => {
+    if (contextGalaxyId < 0) { hideGalaxyContextMenu(); return; }
+    const g = latestCosmicMeta.find((gal) => gal.id === contextGalaxyId);
+    if (g) {
+      const next = GALAXY_MORPHOLOGIES[(GALAXY_MORPHOLOGIES.indexOf(g.morphology) + 1) % GALAXY_MORPHOLOGIES.length];
+      worker.postMessage({ type: 'changeGalaxyType', galaxyId: contextGalaxyId, morphology: next });
+    }
+    hideGalaxyContextMenu();
+  });
+  els.ctxGalaxyDelete.addEventListener('click', () => {
+    if (contextGalaxyId >= 0) worker.postMessage({ type: 'deleteGalaxy', galaxyId: contextGalaxyId });
+    hideGalaxyContextMenu();
+  });
+  els.ctxGalaxyMerge.addEventListener('click', () => {
+    if (contextGalaxyId >= 0) { beginMergeSelection('merge'); mergeSelection = [contextGalaxyId]; updateCosmicStatus(); }
+    hideGalaxyContextMenu();
   });
 
   // --- Creation tools ---
@@ -541,6 +850,8 @@
     els.infoAction.classList.add('hidden');
     els.editRow.classList.add('hidden');
     renderer.selectedIndex = -1;
+    selectedGalaxyId = -1;
+    renderer.selectedGalaxyId = -1;
     contextMenuState.planetIndex = null;
     contextMenuState.moonId = null;
     if (infoPollTimer) {
@@ -707,7 +1018,60 @@
     }, 500);
   }
 
+  // No polling needed the way selectStar's getStarInfo loop is - the full
+  // galaxy list (name/mass/morphology/starCount) is already known
+  // client-side from the last cosmicReady/cosmicBodyDelta message, and
+  // showGalaxyInfo is also re-invoked directly by the cosmicBodyDelta
+  // handler below whenever the selected galaxy might have changed (a mass
+  // edit, a merge involving it, etc.).
+  function selectGalaxy(galaxyId) {
+    if (galaxyId === -1) { hideInfoPanel(); return; }
+    if (mergeSelectMode) {
+      if (!mergeSelection.includes(galaxyId)) mergeSelection.push(galaxyId);
+      updateCosmicStatus();
+      if (mergeSelection.length >= 2) {
+        worker.postMessage({
+          type: mergeSelectMode === 'collide' ? 'collideGalaxies' : 'mergeGalaxies',
+          idA: mergeSelection[0], idB: mergeSelection[1],
+        });
+        mergeSelectMode = null;
+        mergeSelection = [];
+        els.mergeGalaxiesBtn.classList.remove('active');
+        els.collideGalaxiesBtn.classList.remove('active');
+      }
+      return;
+    }
+    selectedGalaxyId = galaxyId;
+    renderer.selectedGalaxyId = galaxyId;
+    showGalaxyInfo(galaxyId);
+  }
+
+  function showGalaxyInfo(galaxyId) {
+    const g = latestCosmicMeta.find((gal) => gal.id === galaxyId);
+    if (!g) { hideInfoPanel(); return; }
+    setInfoRows(g.name, [
+      ['Morphology', g.morphology.charAt(0).toUpperCase() + g.morphology.slice(1)],
+      ['Mass', formatCompact(g.mass) + ' M☉'],
+      ['Stars', String(g.starCount)],
+      ['', ''],
+    ]);
+    els.infoAction.textContent = 'Enter Galaxy →';
+    els.infoAction.classList.remove('hidden');
+    els.infoAction.onclick = () => enterGalaxy(galaxyId);
+  }
+
   renderer.onClick = (sx, sy) => {
+    if (mode === 'cosmic') {
+      if (cosmicCreationMode) {
+        const world = renderer.screenToWorld(sx, sy);
+        worker.postMessage({ type: 'createGalaxy', x: world.x, y: world.y, morphology: randomMorphologyForCreate() });
+        exitCosmicCreationMode();
+        return;
+      }
+      const galaxyId = renderer.findGalaxyAt(latestCosmicPositions, latestCosmicN, sx, sy, 20);
+      selectGalaxy(galaxyId);
+      return;
+    }
     if (!latestPositions) return;
     if (creationMode) {
       handleCreationClick(sx, sy);
@@ -754,6 +1118,17 @@
   }
 
   renderer.onHover = (sx, sy) => {
+    if (mode === 'cosmic') {
+      if (sx < 0 || !latestCosmicPositions) { hideTooltip(); return; }
+      const galaxyId = renderer.findGalaxyAt(latestCosmicPositions, latestCosmicN, sx, sy, 18);
+      const g = latestCosmicMeta.find((gal) => gal.id === galaxyId);
+      if (g) {
+        showTooltip(sx, sy, `${g.name} · ${g.morphology} · ${formatCompact(g.mass)} M☉ · ~${g.starCount} stars`);
+      } else {
+        hideTooltip();
+      }
+      return;
+    }
     if (sx < 0 || !latestPositions) {
       hideTooltip();
       return;
@@ -816,16 +1191,22 @@
 
   els.playPause.addEventListener('click', () => setPlaying(!playing));
 
+  // Both now operate at the universe level, not a single galaxy - "New
+  // Universe"/"Reset" regenerate the whole cosmic web (see currentGalaxyCount's
+  // comment for why). Forces a full cascade back to cosmic first if
+  // currently deeper (galaxy/system), same "one gesture, one clear
+  // outcome" reasoning as the rest of this feature's transitions.
   els.reset.addEventListener('click', () => {
-    init(currentSeed(), currentStarCount());
-    renderer.resetCamera();
+    if (mode === 'system') exitSystem();
+    initUniverse(currentSeed(), { galaxyCount: currentGalaxyCount() });
     setPlaying(true);
   });
 
   els.regen.addEventListener('click', () => {
+    if (mode === 'system') exitSystem();
     const seed = randomSeed();
-    init(seed, currentStarCount());
-    renderer.resetCamera();
+    els.seed.value = seed;
+    initUniverse(seed, { galaxyCount: currentGalaxyCount() });
     setPlaying(true);
   });
 
@@ -1114,6 +1495,63 @@
       applySystemBodyDelta(msg);
     } else if (msg.type === 'collision') {
       handleCollision(msg);
+    } else if (msg.type === 'cosmicReady') {
+      latestCosmicMeta = msg.galaxies;
+      if (msg.fromShare) {
+        loadedFromUniverseShare = true;
+        universeSeed = null;
+        mode = 'cosmic';
+        renderer.mode = 'cosmic';
+        document.body.classList.remove('system-mode');
+        document.body.classList.add('cosmic-mode');
+        els.modeIndicator.textContent = 'Cosmic View';
+        els.modeIndicator.classList.remove('mode-galaxy', 'mode-system');
+        els.modeIndicator.classList.add('mode-cosmic');
+        els.backBtn.classList.add('hidden');
+        showToast('Loaded a shared universe');
+      }
+      updateCosmicStatus();
+    } else if (msg.type === 'cosmicPositions') {
+      latestCosmicPositions = msg.buf;
+      latestCosmicN = msg.n;
+      renderer.setCosmicMeta(latestCosmicMeta);
+      // cosmicPositions.step and positions.step both come from the SAME
+      // shared stepCount in physics-worker.js - updating lastStepSeen here
+      // too (not just from 'positions') is what keeps the Physics Hz stat
+      // accurate while in pure cosmic view, where no galaxy is loaded and
+      // 'positions' messages never fire at all (found empirically: it read
+      // a permanent 0 in cosmic view before this).
+      lastStepSeen = msg.step;
+    } else if (msg.type === 'galaxyEntered') {
+      loadedGalaxyId = msg.galaxyId;
+      // A galaxy's own star-level system saves need a per-galaxy derived
+      // seed, not the app's single global seed field - this is the SAME
+      // storage mechanism (galaxysim:system:${seed}:${starIndex}) every
+      // system save already used, just fed a different seed value at the
+      // one point that matters (activeSeed is read by loadSavedSystem/
+      // saveSystemSnapshot via closure, so setting it here is enough - no
+      // signature changes needed at any of their call sites).
+      activeSeed = universeSeed != null
+        ? `${universeSeed}:galaxy:${msg.galaxyId}`
+        : `shared:galaxy:${msg.galaxyId}`;
+    } else if (msg.type === 'cosmicBodyDelta') {
+      latestCosmicMeta = msg.galaxies;
+      renderer.setCosmicMeta(latestCosmicMeta);
+      updateCosmicStatus();
+      if (selectedGalaxyId !== -1) {
+        if (latestCosmicMeta.some((g) => g.id === selectedGalaxyId)) showGalaxyInfo(selectedGalaxyId);
+        else hideInfoPanel();
+      }
+      saveUniverseSnapshot();
+    } else if (msg.type === 'galaxyCollision') {
+      // Cosmic-layer-only flourish (see cosmic-editor.js's mergeGalaxies
+      // comment for why this isn't a real dual-galaxy star-level collision)
+      // - a bigger, more dramatic burst than an in-system collision gets,
+      // at the merged galaxy's own resulting position.
+      renderer.spawnBurst(msg.merged.x, msg.merged.y, '#ffd24d', {
+        countMin: 80, countMax: 140, life: 0.9, speedMin: 40, speedMax: 220,
+      });
+      playCollisionSound(160);
     }
   };
 
@@ -1129,7 +1567,16 @@
     if (mode === 'system' && focusIndex >= 0 && latestPositions && renderer.tween) {
       renderer.retarget(latestPositions[focusIndex * 2], latestPositions[focusIndex * 2 + 1]);
     }
-    renderer.draw(latestPositions, latestN, now, lastStepSeen);
+    // Cosmic mode draws from its own small positions buffer instead of the
+    // star-level one - draw() branches on renderer.mode internally and
+    // treats whichever buffer is passed as "the" positions for that mode,
+    // so no signature change was needed there, just picking the right
+    // buffer here.
+    if (mode === 'cosmic') {
+      renderer.draw(latestCosmicPositions, latestCosmicN, now, lastStepSeen);
+    } else {
+      renderer.draw(latestPositions, latestN, now, lastStepSeen);
+    }
 
     frames++;
     if (now - lastFpsTime >= 500) {
@@ -1149,22 +1596,42 @@
 
   els.speedLabel.textContent = parseFloat(els.speed.value).toFixed(2) + 'x';
 
-  // A `?system=` link needs SOME galaxy underneath it (init() sets up the
-  // worker's typed-array state, star meta, etc. that everything else
-  // depends on) - just not necessarily the one implied by the seed/count
-  // fields, since the visitor is here for the shared system, not a random
-  // galaxy. init() is still called with the normal seed/count so Back-to-
-  // galaxy and a page refresh without the query param behave normally;
-  // loadSharedSystem is queued right after - the worker processes its
-  // message queue in order, so it runs once init's own 'ready' has already
-  // been emitted, same as any other post-init message.
-  const sharedParam = new URLSearchParams(location.search).get('system');
+  const urlParams = new URLSearchParams(location.search);
+  const universeParam = urlParams.get('universe');
+  const universePayload = universeParam ? decodeUniverse(universeParam) : null;
+  const sharedParam = urlParams.get('system');
   const sharedPayload = sharedParam ? decodeSystem(sharedParam) : null;
-  init(currentSeed() || randomSeed(), currentStarCount());
-  if (sharedPayload) {
+
+  if (universePayload) {
+    // `?universe=` takes priority: land directly in the shared cosmic
+    // view, bypassing the normal seed-based generateUniverse() path
+    // entirely (a full snapshot, not seed+diff - see universe-codec.js).
+    mode = 'cosmic';
+    renderer.mode = 'cosmic';
+    document.body.classList.add('cosmic-mode');
+    renderer.camera.x = 0; renderer.camera.y = 0; renderer.camera.zoom = 0.012;
+    worker.postMessage({ type: 'loadUniverse', payload: universePayload });
+  } else if (sharedPayload) {
+    // A `?system=` link needs SOME galaxy underneath it (init() sets up the
+    // worker's typed-array state, star meta, etc. that everything else
+    // depends on) - just not necessarily the one implied by the seed/count
+    // fields, since the visitor is here for the shared system, not a
+    // random galaxy. init() is still called with the normal seed/count so
+    // Back-to-galaxy and a page refresh without the query param behave
+    // normally; loadSharedSystem is queued right after - the worker
+    // processes its message queue in order, so it runs once init's own
+    // 'ready' has already been emitted, same as any other post-init
+    // message. A system share deliberately bypasses the cosmic wrapper
+    // entirely too - the whole point of the link is "jump straight to this
+    // system," the same way a universe share jumps straight to cosmic view.
+    init(currentSeed() || randomSeed(), currentStarCount());
     loadedFromShare = true;
     worker.postMessage({ type: 'loadSharedSystem', payload: sharedPayload });
+  } else {
+    // Default: boot straight into cosmic view (spec's own stated default).
+    initUniverse(currentSeed() || randomSeed(), { galaxyCount: currentGalaxyCount() });
   }
+
   worker.postMessage({ type: 'setSpeed', speed: parseFloat(els.speed.value) });
   setPlaying(true);
   requestAnimationFrame(frame);
