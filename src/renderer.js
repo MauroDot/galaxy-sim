@@ -39,6 +39,12 @@ class Renderer {
     this.focusIndex = -1;    // index of the star being zoomed into, in system mode
     this.systemMeta = {};    // slot index -> planet metadata (orbitRadius, moons, ...)
 
+    this.selectedIndex = -1; // currently-selected body (set by main.js) - drawn with a selection ring
+    this._newFlashes = [];   // [{index, born, duration}] - new-body glow fade, reads live position
+    this._deleteFades = [];  // [{x,y,color,pixelRadius,born,duration}] - VALUE-snapshotted, not live:
+                              // a freed slot is often immediately reused by the next creation, and a
+                              // live read would visually snap the fade onto the new occupant.
+
     // The core (index 0) is a supermassive black hole that grows by eating
     // wandering black holes/quasars - main.js updates coreMass live as that
     // happens; initialCoreMass (set once, at 'ready') is the baseline its
@@ -307,7 +313,10 @@ class Renderer {
   }
 
   // Moons have no physics-array index (they're pure render-time decoration -
-  // see system-bodies.js), so they need their own hit-test path.
+  // see system-bodies.js), so they need their own hit-test path. Reports the
+  // moon's stable `id` (not its position in the .moons array) - deleting
+  // moon 0 of 2 shifts moon 1 into slot 0, which would silently invalidate
+  // any held reference resolved by array position instead.
   findMoonAt(positions, sx, sy, simStep, thresholdPx = 10) {
     let best = null, bestDist = thresholdPx;
     for (const key in this.systemMeta) {
@@ -316,14 +325,26 @@ class Renderer {
       const meta = this.systemMeta[idx];
       if (!meta.moons || !meta.moons.length) continue;
       const px = positions[idx * 2], py = positions[idx * 2 + 1];
-      for (let m = 0; m < meta.moons.length; m++) {
-        const pos = this._moonWorldPos(px, py, meta.moons[m], simStep);
+      for (const moon of meta.moons) {
+        const pos = this._moonWorldPos(px, py, moon, simStep);
         const p = this.worldToScreen(pos.x, pos.y);
         const d = Math.hypot(p.x - sx, p.y - sy);
-        if (d < bestDist) { bestDist = d; best = { planetIndex: idx, moonIndex: m }; }
+        if (d < bestDist) { bestDist = d; best = { planetIndex: idx, moonId: moon.id }; }
       }
     }
     return best;
+  }
+
+  // --- Selection / creation / deletion visual feedback ---
+
+  flashNew(index, durationMs = 2000) {
+    this._newFlashes.push({ index, born: performance.now(), duration: durationMs });
+  }
+
+  // Snapshotted by value (x, y, color, pixelRadius) rather than read live
+  // per-frame from the index each draw - see the field comment above.
+  startDeleteFade(x, y, color, pixelRadius, durationMs = 500) {
+    this._deleteFades.push({ x, y, color, pixelRadius, born: performance.now(), duration: durationMs });
   }
 
   // --- Particles (supernova bursts, absorption flashes) ---
@@ -549,6 +570,62 @@ class Renderer {
           }
         }
       }
+    }
+
+    // Selection ring: a pulsing outline around the currently-selected body,
+    // read live (it's a real, still-occupied index while selected).
+    if (this.selectedIndex >= 0 && this.selectedIndex < n && positions &&
+        (!this.alive || this.alive[this.selectedIndex])) {
+      const idx = this.selectedIndex;
+      const wx = positions[idx * 2], wy = positions[idx * 2 + 1];
+      const sx = cx + (wx - camera.x) * zoom, sy = cy + (wy - camera.y) * zoom;
+      const baseR = (this.pixelRadius ? this.pixelRadius[idx] : 3 * dpr) || 3 * dpr;
+      const pulse = 1 + 0.15 * Math.sin(now / 220);
+      ctx.strokeStyle = 'rgba(255,255,255,0.8)';
+      ctx.lineWidth = Math.max(1.2, 1.5 * dpr);
+      ctx.beginPath();
+      ctx.arc(sx, sy, (baseR + 5 * dpr) * pulse, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    // New-body flash: an expanding, fading ring at a just-created body's
+    // (live) position - a soft "welcome" pulse, not tied to selection.
+    if (this._newFlashes.length && positions) {
+      const stillActive = [];
+      for (const f of this._newFlashes) {
+        const t = (now - f.born) / f.duration;
+        if (t >= 1 || f.index >= n || (this.alive && !this.alive[f.index])) continue;
+        stillActive.push(f);
+        const wx = positions[f.index * 2], wy = positions[f.index * 2 + 1];
+        const sx = cx + (wx - camera.x) * zoom, sy = cy + (wy - camera.y) * zoom;
+        const baseR = (this.pixelRadius ? this.pixelRadius[f.index] : 3 * dpr) || 3 * dpr;
+        const growR = baseR + t * 14 * dpr;
+        ctx.strokeStyle = `rgba(255,255,255,${(1 - t) * 0.9})`;
+        ctx.lineWidth = Math.max(1, 1.4 * dpr);
+        ctx.beginPath();
+        ctx.arc(sx, sy, growR, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+      this._newFlashes = stillActive;
+    }
+
+    // Delete fade: a shrinking, fading ghost at a just-deleted body's
+    // CAPTURED position/color (not live - see the field comment above).
+    if (this._deleteFades.length) {
+      const stillActive = [];
+      for (const f of this._deleteFades) {
+        const t = (now - f.born) / f.duration;
+        if (t >= 1) continue;
+        stillActive.push(f);
+        const sx = cx + (f.x - camera.x) * zoom, sy = cy + (f.y - camera.y) * zoom;
+        ctx.globalAlpha = 1 - t;
+        ctx.fillStyle = f.color;
+        ctx.beginPath();
+        ctx.arc(sx, sy, Math.max(0.5, f.pixelRadius * (1 - t * 0.5)), 0, Math.PI * 2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+      this._deleteFades = stillActive;
     }
 
     // Debug overlay: a labeled box around every live body's computed screen

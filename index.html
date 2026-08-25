@@ -11,7 +11,42 @@
 
   <div id="transition-overlay"></div>
   <div id="tooltip" class="hidden"></div>
-  <button id="backToGalaxyBtn" class="hidden">← Back to Galaxy</button>
+
+  <div id="systemHud">
+    <div id="systemToolbar">
+      <button id="backToGalaxyBtn" class="hidden" title="Return to the galaxy view">← Back to Galaxy</button>
+      <button id="createPlanetBtn" title="Click, then click the canvas to place a new planet in a circular orbit">+ Create Planet</button>
+      <button id="addAsteroidBtn" title="Spawn a belt of 5-10 small asteroids">🪨 Add Asteroid Field</button>
+      <button id="addCometBtn" title="Launch a comet on an eccentric, fast-moving path">☄ Add Comet</button>
+      <button id="addMoonBtn" title="Click, then click a planet to give it a moon">🌙 Add Moon</button>
+      <button id="saveSystemBtn" title="Generate a shareable link that reproduces this system">🔗 Save System</button>
+    </div>
+
+    <div id="statusLine">
+      Bodies: <span id="statusBodies">-</span>
+      · Stability: <span id="statusStability">-</span>
+      <button id="undoBtn" title="Undo the last action (Ctrl+Z)">↶ Undo</button>
+    </div>
+
+    <div id="creationStatus" class="hidden"></div>
+  </div>
+
+  <div id="contextMenu" class="hidden">
+    <button id="ctxIncreaseMass">Increase Mass ×1.5</button>
+    <button id="ctxDecreaseMass">Decrease Mass ÷1.5</button>
+    <button id="ctxColor">Change Color</button>
+    <button id="ctxDelete">Delete</button>
+    <button id="ctxCopy">Copy Orbital Data</button>
+  </div>
+
+  <div id="shareDialog" class="hidden">
+    <h3>Share this system</h3>
+    <input id="shareUrlInput" type="text" readonly />
+    <div class="row">
+      <button id="shareCopyBtn">Copy</button>
+      <button id="shareCloseBtn">Close</button>
+    </div>
+  </div>
 
   <div id="ui-panel">
     <h1>Galaxy Sim</h1>
@@ -42,6 +77,12 @@
       <button id="regenBtn">🎲 New Galaxy</button>
     </div>
 
+    <div class="row" id="experimentRow" title="Affects the whole simulation, not just the zoomed-in system">
+      <button id="crazyPhysicsBtn" title="Multiply gravity ×10 - affects the whole simulation">⚡ Crazy Physics</button>
+      <button id="lowGravityBtn" title="Divide gravity ÷4 - affects the whole simulation">🪶 Low Gravity</button>
+      <button id="timeWarpBtn" title="Jump to a much higher speed until toggled off">⏩ Time Warp</button>
+    </div>
+
     <div id="stats">
       <div>FPS: <span id="fpsStat">-</span></div>
       <div>Physics Hz: <span id="physStat">-</span></div>
@@ -66,6 +107,7 @@
     </div>
 
     <p class="hint">Scroll to zoom · Drag to pan · Space to play/pause · Click a body for info · D for debug overlay</p>
+    <p class="hint">In a system: right-click a body to edit · Delete to remove · M/C/R to adjust mass/color/orbit · Ctrl+Z to undo</p>
   </div>
 
   <div id="info-panel" class="hidden">
@@ -78,9 +120,24 @@
     <div class="info-row hidden" id="infoRow6"><span id="infoLabel6">-</span><span id="infoValue6">-</span></div>
     <div id="infoFlash" class="hidden"></div>
     <button id="infoAction" class="hidden"></button>
+
+    <div id="infoEditRow" class="hidden">
+      <div class="edit-mass-row">
+        <button id="massMinusBtn" title="Decrease mass">−</button>
+        <span id="massEditValue">-</span>
+        <button id="massPlusBtn" title="Increase mass">+</button>
+        <span id="stabilityDot" title="Orbital stability"></span>
+      </div>
+      <div class="edit-actions-row">
+        <button id="colorEditBtn" title="Cycle color">🎨 Color</button>
+        <button id="lockEditBtn" title="Lock this body into a fixed circular orbit">🔒 Lock Orbit</button>
+        <button id="deleteEditBtn" title="Delete this body (Delete key)">🗑 Delete</button>
+      </div>
+    </div>
   </div>
 
   <script src="src/star-types.js"></script>
+  <script src="src/share-codec.js"></script>
   <script src="src/renderer.js"></script>
   <script src="src/main.js"></script>
 </body>

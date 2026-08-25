@@ -3,20 +3,46 @@
 // off the main thread so rendering stays smooth. Also ages stars and
 // triggers supernovae when a star's age reaches its main-sequence lifetime,
 // absorbs any star that strays within an absorber's (black hole/quasar)
-// capture radius, and generates/hosts a zoomed-in star's planetary system
-// on request. Black holes/quasars need no special gravity code - they're
-// just very massive point bodies in the same quadtree/integration loop as
-// everything else; planets are the same, at Earth-mass-converted scale.
-// The galactic core (index 0) is itself a supermassive black hole: it
-// consumes any wandering black hole/quasar that strays within its own
-// capture radius and grows its own mass by the absorbed body's mass - same
-// principle, the increased mass just flows into the next tree build/force
-// calc for free, no special gravity code needed there either.
+// capture radius, generates/hosts a zoomed-in star's planetary system on
+// request, and now hosts a full interactive system editor (create/delete/
+// edit bodies, asteroid fields, comets, collisions, undo - see
+// system-editor.js) plus "System Experiments" (a mutable G) and a pinned-
+// body mechanic (the core, and a shared-system's synthetic host, never
+// move regardless of gravity acting on them - they still exert gravity on
+// everything else normally). Black holes/quasars/planets/asteroids/comets
+// all need no special gravity code - they're just point bodies of varying
+// mass in the same quadtree/integration loop as everything else.
+//
+// Also independently Node-harness-testable (unlike every other worker-side
+// file, this one didn't used to be - see scratchpad tests for this
+// feature): postMessage calls go through a local emit() that falls back to
+// a test-visible sink when postMessage isn't a global, importScripts is
+// guarded the same way every other file already guards its own
+// environment-specific bits, and self.onmessage's switch body is a plain
+// function a test harness can call directly.
 
-importScripts('quadtree.js', 'star-types.js', 'galaxy.js', 'system-bodies.js');
+if (typeof importScripts !== 'undefined') {
+  importScripts('quadtree.js', 'star-types.js', 'galaxy.js', 'system-bodies.js', 'system-editor.js');
+} else {
+  // Node/CommonJS test-harness path only.
+  Object.assign(globalThis, require('./quadtree.js'));
+  Object.assign(globalThis, require('./star-types.js'));
+  Object.assign(globalThis, require('./galaxy.js'));
+  Object.assign(globalThis, require('./system-bodies.js'));
+  Object.assign(globalThis, require('./system-editor.js'));
+}
+
+const _testSink = []; // Node-harness-only: emit() falls back to this
+function emit(msg, transfer) {
+  if (typeof postMessage !== 'undefined') {
+    postMessage(msg, transfer);
+  } else {
+    _testSink.push(msg);
+  }
+}
 
 const DT = 1 / 60;       // fixed physics timestep (seconds) - unchanged
-const G = 0.6;
+let G = DEFAULT_G;        // mutable now - "System Experiments" (Crazy Physics/Low Gravity)
 const SOFTENING = 12;    // avoids blow-ups on close encounters
 const THETA = 0.6;       // Barnes-Hut accuracy/speed tradeoff
 const TICK_MS = 1000 / 60;
@@ -74,30 +100,55 @@ function buildTree(s) {
   return tree;
 }
 
-// Advance physics by one fixed step, age every living star, absorb any body
-// that has strayed within an absorber's capture radius, and report both
-// kinds of removal events (supernova, absorption) for this step. Reserved-
-// but-unpopulated system-body slots (alive=0) and populated planet slots
-// (ordinary alive bodies) both flow through these same loops for free.
+// Advance physics by one fixed step. Handles (in order): gravity kick+drift
+// (skipping pinned/locked-orbit bodies), locked-orbit kinematic repositioning,
+// core-eats-absorber, absorber-eats-body, system-body collisions, and
+// stellar aging/supernova. Returns every kind of removal/merge event for
+// this step so the caller can broadcast them.
 function step(s) {
   const tree = buildTree(s);
   const n = s.n;
 
   // Kick: apply accelerations from the tree built at the current positions
   // (symplectic/semi-implicit Euler - stable and cheap for a real-time viz).
+  // Pinned bodies (the core, a shared-system's synthetic host) and
+  // locked-orbit bodies are skipped here - they still exert gravity on
+  // everyone else (they're still in the tree above), they just don't
+  // accelerate from it.
   for (let i = 0; i < n; i++) {
-    if (!s.alive[i]) continue;
+    if (!s.alive[i] || s.pinned[i] || s.lockedOrbit[i]) continue;
     const body = { x: s.x[i], y: s.y[i], mass: s.mass[i] };
     const f = tree.calculateForce(body, G);
     const invM = 1 / s.mass[i];
     s.vx[i] += f.fx * invM * DT;
     s.vy[i] += f.fy * invM * DT;
   }
-  // Drift.
+  // Drift. Pinned bodies never accelerate so their velocity stays at
+  // whatever it was initialized to (0) - this naturally leaves them
+  // motionless without needing to also skip them here. Locked-orbit bodies
+  // ARE skipped here too (their position is set kinematically below instead).
   for (let i = 0; i < n; i++) {
-    if (!s.alive[i]) continue;
+    if (!s.alive[i] || s.lockedOrbit[i]) continue;
     s.x[i] += s.vx[i] * DT;
     s.y[i] += s.vy[i] * DT;
+  }
+
+  // Locked-orbit kinematic override: position/velocity recomputed directly
+  // from stored orbital parameters (same formula moons already use, applied
+  // here to a REAL body) rather than integrated - "Lock Orbit" freezes a
+  // body into a circular path even if its mass later changes.
+  for (const idxStr in s.lockedOrbit) {
+    const idx = Number(idxStr);
+    if (!s.alive[idx]) { delete s.lockedOrbit[idx]; continue; }
+    const lock = s.lockedOrbit[idx];
+    const hostIdx = lock.hostIndex;
+    const t = stepCount * DT;
+    const angle = lock.phase0 + lock.angularSpeed * t;
+    s.x[idx] = s.x[hostIdx] + Math.cos(angle) * lock.radius;
+    s.y[idx] = s.y[hostIdx] + Math.sin(angle) * lock.radius;
+    const v = lock.radius * lock.angularSpeed;
+    s.vx[idx] = s.vx[hostIdx] - Math.sin(angle) * v;
+    s.vy[idx] = s.vy[hostIdx] + Math.cos(angle) * v;
   }
 
   // Core consumption: the core (index 0) is itself a supermassive black
@@ -132,6 +183,7 @@ function step(s) {
   // emergent hazard, not a bug). Cheap (n * numAbsorbers distance checks,
   // and there are only ever a handful), so it runs every step for free.
   const absorbed = [];
+  let absorbedSystemBody = false;
   if (s.absorberIndices.length) {
     for (let i = 1; i < n; i++) {
       if (!s.alive[i] || isAbsorber(s.type[i])) continue;
@@ -142,16 +194,41 @@ function step(s) {
           s.alive[i] = 0;
           s.absorbedCount[bhIdx] = (s.absorbedCount[bhIdx] || 0) + 1;
           absorbed.push({ starIndex: i, blackHoleIndex: bhIdx });
+          // A system body (one of the zoomed-in star's planets/asteroids/
+          // comets) can be swept up here too - unlike an ordinary galaxy
+          // star it also occupies a reserved pool slot tracked in
+          // systemBodyIndices. Free it the same way deleteBody() does, or
+          // it leaks permanently: findFreeSlot never reclaims a slot whose
+          // `type` is still PLANET_TYPE_CODE, and the stale index lingers
+          // in systemBodyIndices forever, silently disagreeing with
+          // anything that filters by `alive` (an undo snapshot) versus
+          // anything that doesn't (currentSlots(), used for every
+          // systemBodyDelta broadcast and the status-line body count).
+          if (s.systemMeta[i]) {
+            s.type[i] = SYSTEM_EMPTY_TYPE_CODE;
+            s.mass[i] = 1;
+            delete s.systemMeta[i];
+            delete s.lockedOrbit[i];
+            absorbedSystemBody = true;
+          }
           break;
         }
       }
     }
+    if (absorbedSystemBody) {
+      s.systemBodyIndices = s.systemBodyIndices.filter((idx) => s.alive[idx]);
+    }
   }
+
+  // System-body collisions: O(k^2) over state.systemBodyIndices only (never
+  // the core/host/galaxy stars), dormant (near-zero cost) whenever fewer
+  // than 2 system bodies exist. See system-editor.js for the merge rule.
+  const { events: collisions } = checkCollisions(s);
 
   // Age stars (skip index 0, the immortal central mass) and collect any
   // that just died so the caller can broadcast supernova events. Absorbers,
-  // neutron stars, and planets all carry lifetime=Infinity so this never
-  // fires for them.
+  // neutron stars, and planets/asteroids/comets all carry lifetime=Infinity
+  // so this never fires for them.
   const died = [];
   for (let i = 1; i < n; i++) {
     if (!s.alive[i]) continue;
@@ -163,29 +240,31 @@ function step(s) {
   }
 
   stepCount++;
-  return { died, absorbed, coreAbsorptions };
+  return { died, absorbed, coreAbsorptions, collisions, absorbedSystemBody };
 }
 
 function initSim(newSeed, newNumStars, newParams) {
   seed = newSeed;
   numStars = newNumStars;
   params = newParams || {};
+  G = DEFAULT_G; // "System Experiments" toggles reset on reload/regen
   const g = generateGalaxy(seed, numStars, params);
 
-  // Capacity model: allocate room for MAX_SYSTEM_BODIES reserved, dormant
-  // "system body" slots after the real galaxy bodies. buildTree()/step()
-  // above need zero changes for this - they already skip !alive[i], so
-  // these slots cost nothing until a system populates them. state.n is the
-  // full capacity (loop bound / positions-buffer size); state.realStarCount
-  // is what the UI reports as "Stars" - keeping these separate is what
-  // stops the stat from reading inflated by up to MAX_SYSTEM_BODIES.
-  const capacity = g.n + MAX_SYSTEM_BODIES;
+  // Capacity model: allocate room for SYSTEM_POOL_CAPACITY reserved,
+  // dormant "system body" slots after the real galaxy bodies. buildTree()/
+  // step() above need zero changes for this - they already skip !alive[i],
+  // so these slots cost nothing until populated. state.n is the full
+  // capacity (loop bound / positions-buffer size); state.realStarCount is
+  // what the UI reports as "Stars" - keeping these separate is what stops
+  // the stat from reading inflated.
+  const capacity = g.n + SYSTEM_POOL_CAPACITY;
   const x = new Float64Array(capacity), y = new Float64Array(capacity);
   const vx = new Float64Array(capacity), vy = new Float64Array(capacity);
   const mass = new Float64Array(capacity), radius = new Float64Array(capacity);
   const age = new Float64Array(capacity), lifetime = new Float64Array(capacity);
   const type = new Uint8Array(capacity);
   const alive = new Uint8Array(capacity);
+  const pinned = new Uint8Array(capacity);
 
   x.set(g.x); y.set(g.y); vx.set(g.vx); vy.set(g.vy);
   mass.set(g.mass); radius.set(g.radius); age.set(g.age); lifetime.set(g.lifetime);
@@ -197,6 +276,7 @@ function initSim(newSeed, newNumStars, newParams) {
     mass[i] = 1; // never 0 - a stray uninitialized slot can never NaN a force calc
     lifetime[i] = Infinity;
   }
+  pinned[0] = 1; // the core is anchored at the origin forever (Part 1)
 
   const absorberIndices = [];
   const absorbedCount = {};
@@ -212,19 +292,23 @@ function initSim(newSeed, newNumStars, newParams) {
   }
 
   state = {
-    x, y, vx, vy, mass, radius, age, lifetime, type, alive,
+    x, y, vx, vy, mass, radius, age, lifetime, type, alive, pinned,
     n: capacity,
     realStarCount: g.n,
     absorberIndices,
     absorbedCount,
     coreConsumedCount: 0,
     focusIndex: -1,
-    focusSlotCount: 0,
+    systemBodyIndices: [],
     systemMeta: {},
+    lockedOrbit: {},
+    undoStack: [],
+    nextCustomIndex: 1,
+    nextMoonId: 1,
   };
   acc = 0;
   stepCount = 0;
-  postMessage({
+  emit({
     type: 'ready',
     n: state.n,
     realStarCount: state.realStarCount,
@@ -247,7 +331,7 @@ function postPositions() {
     buf[i * 2] = state.x[i];
     buf[i * 2 + 1] = state.y[i];
   }
-  postMessage({ type: 'positions', n, step: stepCount, buf }, [buf.buffer]);
+  emit({ type: 'positions', n, step: stepCount, buf }, [buf.buffer]);
 }
 
 function tick() {
@@ -257,20 +341,24 @@ function tick() {
   const allDied = [];
   const allAbsorbed = [];
   const allCoreAbsorptions = [];
+  const allCollisions = [];
+  let anySystemBodyAbsorbed = false;
   // Cap substeps per tick so a runaway speed value can't stall the worker.
   let guard = 0;
   while (acc >= 1 && guard < 240) {
-    const { died, absorbed, coreAbsorptions } = step(state);
+    const { died, absorbed, coreAbsorptions, collisions, absorbedSystemBody } = step(state);
     if (died.length) allDied.push(...died);
     if (absorbed.length) allAbsorbed.push(...absorbed);
     if (coreAbsorptions.length) allCoreAbsorptions.push(...coreAbsorptions);
+    if (collisions.length) allCollisions.push(...collisions);
+    if (absorbedSystemBody) anySystemBodyAbsorbed = true;
     acc -= 1;
     stepped = true;
     guard++;
   }
   if (stepped) postPositions();
   for (const i of allDied) {
-    postMessage({
+    emit({
       type: 'supernova',
       index: i,
       x: state.x[i],
@@ -279,7 +367,7 @@ function tick() {
     });
   }
   for (const { starIndex, blackHoleIndex } of allAbsorbed) {
-    postMessage({
+    emit({
       type: 'absorption',
       starIndex,
       blackHoleIndex,
@@ -291,7 +379,7 @@ function tick() {
     });
   }
   for (const { blackHoleIndex, newCoreMass } of allCoreAbsorptions) {
-    postMessage({
+    emit({
       type: 'coreAbsorption',
       blackHoleIndex,
       x: state.x[0],
@@ -300,11 +388,22 @@ function tick() {
       coreConsumedCount: state.coreConsumedCount,
     });
   }
+  for (const ev of allCollisions) {
+    emit({ type: 'collision', ...ev });
+  }
+  // A wandering absorber eating one of the zoomed-in system's own bodies
+  // (see the absorber-capture comment in step()) changes systemBodyIndices
+  // just like a collision merge does - resync the same way, or the status
+  // line / info panel keep showing a body that's already gone until the
+  // next unrelated user action happens to trigger a resync.
+  if (allCollisions.length || anySystemBodyAbsorbed) {
+    broadcastSystemDelta(allCollisions.length ? 'collision' : 'absorbed', null);
+  }
 }
 
 function play() {
   playing = true;
-  if (!timer) timer = setInterval(tick, TICK_MS);
+  if (!timer && typeof setInterval !== 'undefined') timer = setInterval(tick, TICK_MS);
 }
 
 function pause() {
@@ -319,45 +418,41 @@ function pause() {
 
 function evictSystem() {
   if (!state || state.focusIndex === -1) return;
-  const base = state.realStarCount;
-  for (let i = 0; i < state.focusSlotCount; i++) {
-    const idx = base + i;
-    state.alive[idx] = 0;
-    state.type[idx] = SYSTEM_EMPTY_TYPE_CODE;
-    state.mass[idx] = 1;
-    delete state.systemMeta[idx];
-  }
+  clearSystemBodies(state);
   state.focusIndex = -1;
-  state.focusSlotCount = 0;
 }
 
-// Non-destructive: current live planets' state relative to their host star,
-// for persistence (used by both a real exit and a periodic autosave peek).
+// Persisted-save shape: {starIndex, genSignature, hostType, hostMass,
+// nextCustomIndex, nextMoonId, bodies}. `bodies` generalizes the old
+// planets-only shape (now tags each with `kind`); a save from before this
+// feature (which used `planets`, not `bodies`) is simply treated as
+// invalid and regenerated fresh - graceful degradation, no migration code.
 function buildSnapshot() {
   if (!state || state.focusIndex === -1) return null;
   const starIndex = state.focusIndex;
-  const hostX = state.x[starIndex], hostY = state.y[starIndex];
-  const hostVX = state.vx[starIndex], hostVY = state.vy[starIndex];
-  const base = state.realStarCount;
-  const planets = [];
-  for (let i = 0; i < state.focusSlotCount; i++) {
-    const idx = base + i;
-    if (!state.alive[idx]) continue; // may have been absorbed since generation
-    const meta = state.systemMeta[idx];
-    planets.push({
-      name: meta.name, massEarth: meta.massEarth, orbitRadius: meta.orbitRadius,
-      color: meta.color, composition: meta.composition, tempK: meta.tempK, moons: meta.moons,
-      relX: state.x[idx] - hostX, relY: state.y[idx] - hostY,
-      relVX: state.vx[idx] - hostVX, relVY: state.vy[idx] - hostVY,
-    });
-  }
   return {
     starIndex,
     genSignature: `${seed}:${numStars}:${starIndex}`,
     hostType: state.type[starIndex],
     hostMass: state.mass[starIndex],
-    planets,
+    nextCustomIndex: state.nextCustomIndex,
+    nextMoonId: state.nextMoonId,
+    bodies: buildBodiesSnapshot(state),
   };
+}
+
+function currentSlots() {
+  return state.systemBodyIndices.map((i) => ({ index: i, ...state.systemMeta[i] }));
+}
+
+function broadcastSystemDelta(action, result) {
+  postPositions();
+  emit({
+    type: 'systemBodyDelta',
+    action, result,
+    slots: currentSlots(),
+    snapshot: buildSnapshot(),
+  });
 }
 
 function enterSystem(starIndex, saved) {
@@ -365,14 +460,8 @@ function enterSystem(starIndex, saved) {
 
   if (state.focusIndex === starIndex) {
     // Already live - just re-report the current slots.
-    const base = state.realStarCount;
-    const slots = [];
-    for (let i = 0; i < state.focusSlotCount; i++) {
-      const idx = base + i;
-      if (state.alive[idx]) slots.push({ index: idx, ...state.systemMeta[idx] });
-    }
-    postMessage({
-      type: 'systemReady', starIndex, wasGenerated: false, slots,
+    emit({
+      type: 'systemReady', starIndex, wasGenerated: false, slots: currentSlots(),
       starMeta: { type: state.type[starIndex], mass: state.mass[starIndex] },
     });
     return;
@@ -385,68 +474,39 @@ function enterSystem(starIndex, saved) {
   const hostVX = state.vx[starIndex], hostVY = state.vy[starIndex];
   const genSignature = `${seed}:${numStars}:${starIndex}`;
 
-  let planets, wasGenerated;
+  state.focusIndex = starIndex;
+  state.undoStack = [];
+  state.nextCustomIndex = 1;
+  state.nextMoonId = 1;
+
+  let wasGenerated;
   if (saved && saved.genSignature === genSignature && saved.hostType === hostType &&
-      Math.abs(saved.hostMass - hostMass) < 1e-6 && Array.isArray(saved.planets)) {
-    planets = saved.planets;
+      Math.abs(saved.hostMass - hostMass) < 1e-6 && Array.isArray(saved.bodies)) {
+    state.nextCustomIndex = saved.nextCustomIndex || 1;
+    state.nextMoonId = saved.nextMoonId || 1;
+    restoreBodiesFromSnapshot(state, saved.bodies);
     wasGenerated = false;
   } else {
-    planets = generateSystem(seed, starIndex, hostMass, hostType).planets;
+    const generated = generateSystem(seed, starIndex, hostMass, hostType).planets;
+    for (const p of generated) {
+      const idx = findFreeSlot(state);
+      if (idx === -1) break;
+      const { vx, vy } = circularOrbitVelocity(G, hostMass, hostVX, hostVY, p.orbitRadius, p.angle0);
+      placeBody(
+        state, idx, starIndex,
+        hostX + Math.cos(p.angle0) * p.orbitRadius, hostY + Math.sin(p.angle0) * p.orbitRadius, vx, vy,
+        p.massEarth,
+        {
+          kind: 'planet', name: p.name, radiusPx: p.radiusPx, color: p.color,
+          composition: p.composition, tempK: p.tempK, orbitRadius: p.orbitRadius,
+          moons: p.moons, collisionRadius: collisionRadiusFor(p.massEarth),
+        }
+      );
+    }
     wasGenerated = true;
   }
 
-  const base = state.realStarCount;
-  const count = Math.min(planets.length, MAX_SYSTEM_BODIES);
-  const slots = [];
-  for (let i = 0; i < count; i++) {
-    const idx = base + i;
-    const p = planets[i];
-    let px, py, pvx, pvy;
-    if (!wasGenerated) {
-      px = hostX + p.relX; py = hostY + p.relY;
-      pvx = hostVX + p.relVX; pvy = hostVY + p.relVY;
-    } else {
-      px = hostX + Math.cos(p.angle0) * p.orbitRadius;
-      py = hostY + Math.sin(p.angle0) * p.orbitRadius;
-      const v = Math.sqrt((G * hostMass) / p.orbitRadius);
-      pvx = hostVX - Math.sin(p.angle0) * v;
-      pvy = hostVY + Math.cos(p.angle0) * v;
-    }
-    state.x[idx] = px; state.y[idx] = py;
-    state.vx[idx] = pvx; state.vy[idx] = pvy;
-    state.mass[idx] = p.massEarth * EARTH_MASS_IN_SOLAR;
-    state.radius[idx] = p.radiusPx; // display px directly, not a world-unit star radius
-    state.type[idx] = PLANET_TYPE_CODE;
-    state.alive[idx] = 1;
-    state.age[idx] = 0;
-    state.lifetime[idx] = Infinity;
-
-    state.systemMeta[idx] = {
-      name: p.name, massEarth: p.massEarth, orbitRadius: p.orbitRadius,
-      radiusPx: p.radiusPx, color: p.color, composition: p.composition,
-      tempK: p.tempK, hostIndex: starIndex, moons: p.moons,
-    };
-    slots.push({ index: idx, ...state.systemMeta[idx] });
-  }
-
-  state.focusIndex = starIndex;
-  state.focusSlotCount = count;
-
-  // Temporary debug logging (per debugging request) - confirms the slots
-  // actually got populated with valid, host-relative coordinates. Safe to
-  // remove once planet visibility is confirmed fixed.
-  console.log(
-    `[physics-worker] enterSystem(${starIndex}): placed ${count} planet slot(s) ` +
-    `(host at ${hostX.toFixed(1)},${hostY.toFixed(1)}):`,
-    slots.map((s) => ({
-      index: s.index, name: s.name,
-      x: +state.x[s.index].toFixed(1), y: +state.y[s.index].toFixed(1),
-      relX: +(state.x[s.index] - hostX).toFixed(1), relY: +(state.y[s.index] - hostY).toFixed(1),
-      alive: !!state.alive[s.index],
-    }))
-  );
-
-  // The new planets' positions only exist in worker state so far - tick()
+  // The new bodies' positions only exist in worker state so far - tick()
   // is what normally broadcasts a fresh 'positions' buffer, but that only
   // fires while playing. Without this, entering a system while paused would
   // leave the main thread rendering/hit-testing stale (zero-initialized)
@@ -455,12 +515,64 @@ function enterSystem(starIndex, saved) {
   // that message is handled.
   postPositions();
 
-  postMessage({
+  emit({
     type: 'systemReady',
     starIndex,
     wasGenerated,
-    slots,
+    slots: currentSlots(),
     starMeta: { type: hostType, mass: hostMass },
+  });
+}
+
+// Loads a shared system from a decoded URL payload (see share-codec.js,
+// main-thread-only). The shared system gets its own synthetic host - not
+// any real galaxy star - placed far outside the visible galaxy (so it's
+// gravitationally inert relative to it) and pinned (Part 1's mechanism
+// generalizes to this too, not just the core).
+function loadSharedSystem(payload) {
+  if (!state) return;
+  if (state.focusIndex !== -1) evictSystem();
+
+  const hostIdx = findFreeSlot(state);
+  if (hostIdx === -1) return; // pool exhausted (shouldn't happen on a fresh galaxy)
+
+  const hostX = 5000, hostY = 5000;
+  state.x[hostIdx] = hostX; state.y[hostIdx] = hostY;
+  state.vx[hostIdx] = 0; state.vy[hostIdx] = 0;
+  state.mass[hostIdx] = payload.hostMass;
+  state.type[hostIdx] = payload.hostType;
+  state.radius[hostIdx] = 0;
+  state.alive[hostIdx] = 1;
+  state.age[hostIdx] = 0;
+  state.lifetime[hostIdx] = Infinity;
+  state.pinned[hostIdx] = 1;
+
+  state.focusIndex = hostIdx;
+  state.undoStack = [];
+  state.nextCustomIndex = 1;
+  state.nextMoonId = 1;
+
+  const bodies = (payload.bodies || []).map((b) => {
+    const { vx, vy } = circularOrbitVelocity(G, payload.hostMass, 0, 0, b.orbitRadius, b.angle0, b.speedMult);
+    return {
+      kind: b.kind, name: b.name, massEarth: b.massEarth, radiusPx: planetRadiusPxFor(b.massEarth),
+      color: b.color, composition: b.composition, tempK: null, orbitRadius: b.orbitRadius,
+      moons: [], locked: false,
+      relX: Math.cos(b.angle0) * b.orbitRadius, relY: Math.sin(b.angle0) * b.orbitRadius,
+      relVX: vx, relVY: vy,
+    };
+  });
+  restoreBodiesFromSnapshot(state, bodies);
+
+  postPositions();
+  emit({
+    type: 'systemReady',
+    starIndex: hostIdx,
+    wasGenerated: true,
+    fromShare: true,
+    creatorName: payload.creatorName || null,
+    slots: currentSlots(),
+    starMeta: { type: payload.hostType, mass: payload.hostMass },
   });
 }
 
@@ -484,26 +596,31 @@ function sendStarInfo(index) {
   if (typeCode === PLANET_TYPE_CODE && state.systemMeta[index]) {
     const meta = state.systemMeta[index];
     const hostVX = state.vx[meta.hostIndex], hostVY = state.vy[meta.hostIndex];
+    const dx = state.x[index] - state.x[meta.hostIndex], dy = state.y[index] - state.y[meta.hostIndex];
+    const currentRadius = Math.hypot(dx, dy);
     const orbitalSpeed = Math.hypot(state.vx[index] - hostVX, state.vy[index] - hostVY);
-    const periodSeconds = orbitalSpeed > 0 ? (2 * Math.PI * meta.orbitRadius) / orbitalSpeed : Infinity;
+    const periodSeconds = orbitalSpeed > 0 ? (2 * Math.PI * currentRadius) / orbitalSpeed : Infinity;
     Object.assign(payload, {
       isPlanet: true,
+      kind: meta.kind,
       name: meta.name,
       massEarth: meta.massEarth,
       orbitRadius: meta.orbitRadius,
+      currentRadius,
       tempK: meta.tempK,
       composition: meta.composition,
       hostIndex: meta.hostIndex,
       orbitalSpeed,
       periodYears: periodSeconds * ORBIT_PERIOD_YEAR_SCALE,
       moons: meta.moons,
+      locked: !!meta.locked,
+      stability: stabilityFor(currentRadius, meta.orbitRadius),
     });
   }
-  postMessage(payload);
+  emit(payload);
 }
 
-self.onmessage = (e) => {
-  const msg = e.data;
+function handleMessage(msg) {
   switch (msg.type) {
     case 'init':
       initSim(msg.seed, msg.numStars, msg.params);
@@ -531,15 +648,111 @@ self.onmessage = (e) => {
       const snapshot = buildSnapshot();
       evictSystem();
       postPositions(); // same reasoning as enterSystem: keep the buffer fresh even while paused
-      if (snapshot) postMessage({ type: 'systemSnapshot', ...snapshot });
+      if (snapshot) emit({ type: 'systemSnapshot', ...snapshot });
       break;
     }
     case 'peekSystemSnapshot': {
       const snapshot = buildSnapshot();
-      if (snapshot) postMessage({ type: 'systemSnapshot', ...snapshot, peek: true });
+      if (snapshot) emit({ type: 'systemSnapshot', ...snapshot, peek: true });
       break;
     }
+    case 'setPhysicsParams':
+      if (typeof msg.G === 'number' && msg.G > 0) G = msg.G;
+      break;
+    case 'createPlanet': {
+      if (state.focusIndex === -1) break;
+      pushUndoSnapshot(state);
+      const result = createPlanet(state, G, msg.x, msg.y);
+      broadcastSystemDelta('createPlanet', result);
+      break;
+    }
+    case 'deleteBody': {
+      if (state.focusIndex === -1) break;
+      pushUndoSnapshot(state);
+      const result = deleteBody(state, msg.index);
+      broadcastSystemDelta('deleteBody', result);
+      break;
+    }
+    case 'deleteMoon': {
+      if (state.focusIndex === -1) break;
+      pushUndoSnapshot(state);
+      const result = deleteMoon(state, msg.planetIndex, msg.moonId);
+      broadcastSystemDelta('deleteMoon', { planetIndex: msg.planetIndex, moon: result });
+      break;
+    }
+    case 'adjustMass': {
+      if (state.focusIndex === -1) break;
+      pushUndoSnapshot(state);
+      const result = adjustMass(state, msg.index, msg.massEarth);
+      broadcastSystemDelta('adjustMass', result);
+      break;
+    }
+    case 'cycleColor': {
+      if (state.focusIndex === -1) break;
+      pushUndoSnapshot(state);
+      const result = cycleColor(state, msg.index);
+      broadcastSystemDelta('cycleColor', result);
+      break;
+    }
+    case 'recalcOrbit': {
+      if (state.focusIndex === -1) break;
+      pushUndoSnapshot(state);
+      const result = recalcOrbit(state, G, msg.index);
+      broadcastSystemDelta('recalcOrbit', result);
+      break;
+    }
+    case 'lockOrbit': {
+      if (state.focusIndex === -1) break;
+      pushUndoSnapshot(state);
+      const result = msg.locked ? lockOrbit(state, G, msg.index) : unlockOrbit(state, msg.index);
+      broadcastSystemDelta('lockOrbit', result);
+      break;
+    }
+    case 'addAsteroidField': {
+      if (state.focusIndex === -1) break;
+      pushUndoSnapshot(state);
+      const result = addAsteroidField(state, G);
+      broadcastSystemDelta('addAsteroidField', result);
+      break;
+    }
+    case 'addComet': {
+      if (state.focusIndex === -1) break;
+      pushUndoSnapshot(state);
+      const result = addComet(state, G);
+      broadcastSystemDelta('addComet', result);
+      break;
+    }
+    case 'addMoon': {
+      if (state.focusIndex === -1) break;
+      pushUndoSnapshot(state);
+      const result = addMoon(state, msg.planetIndex);
+      broadcastSystemDelta('addMoon', result);
+      break;
+    }
+    case 'undo': {
+      if (state.focusIndex === -1) break;
+      const ok = undo(state);
+      if (ok) broadcastSystemDelta('undo', null);
+      break;
+    }
+    case 'loadSharedSystem':
+      loadSharedSystem(msg.payload);
+      break;
     default:
       break;
   }
-};
+}
+
+if (typeof self !== 'undefined' && typeof importScripts !== 'undefined') {
+  self.onmessage = (e) => handleMessage(e.data);
+}
+
+if (typeof module !== 'undefined') {
+  module.exports = {
+    handleMessage,
+    _testSink,
+    _getState: () => state,
+    _getG: () => G,
+    _step: () => step(state),
+  };
+}

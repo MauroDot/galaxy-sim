@@ -83,12 +83,84 @@ function exoticTypeByCode(code) {
 const PLANET_TYPE_CODE = 251;
 const SYSTEM_EMPTY_TYPE_CODE = 250;
 
-// Up to 5 planets per star (spec's own stated max) - moons are NOT physics
-// bodies (see galaxy-sim README / code comments for why: at planet mass
-// ~1e-6x the star, a stable moon orbit sits well inside SOFTENING=12,
-// where the 1/r^2 force is nearly flat - moons are rendered as pure
-// decoration instead, animated from stored orbital parameters only).
-const MAX_SYSTEM_BODIES = 5;
+// Up to 5 auto-generated planets per star (spec's own stated max) - moons
+// are NOT physics bodies (see galaxy-sim README / code comments for why:
+// at planet mass ~1e-6x the star, a stable moon orbit sits well inside
+// SOFTENING=12, where the 1/r^2 force is nearly flat - moons are rendered
+// as pure decoration instead, animated from stored orbital parameters).
+const MAX_AUTO_PLANETS = 5;
+
+// Total reserved "system body" pool size (planets + asteroids + comets,
+// auto-generated AND user-created, all sharing one dynamic slot pool - see
+// physics-worker.js's findFreeSlot()). Deliberately much larger than
+// MAX_AUTO_PLANETS: creation tools let a user add asteroid fields/comets/
+// custom planets freely during a session, up to the "100 bodies" perf
+// target, with headroom. Bumping this costs at most 128 extra (skipped,
+// dormant) !alive[i] iterations per physics step, for every galaxy whether
+// it's ever zoomed into or not - immaterial next to a 500+ body buildTree().
+const SYSTEM_POOL_CAPACITY = 128;
+
+// World-unit collision radius for system-body collision detection - a
+// distinct quantity from radiusPx (which is display pixels only).
+//
+// Tuned empirically (see scratchpad test_collision_tuning.js) against real
+// auto-generated systems, not just the orbit-radius spacing formula alone:
+// a first pass at 1.5 looked reasonable on paper (nominal adjacent-orbit
+// spacing is ~26 units for a 5-planet system) but actually merged planets
+// spuriously in ~38% of a 30-trial/5-sim-minute sweep - a rare pair of
+// high-mass planets (log-uniform up to 300 M_earth; cbrt(300)~=6.7) drawn
+// into adjacent orbit slots already sums to a collision radius (2x1.5x6.7
+// ~= 20 units) close enough to that spacing that ordinary jitter+drift
+// crossed it. 0.35 keeps that same worst case (2x0.35x6.7 ~= 4.7 units)
+// comfortably below nominal spacing while still reliably merging a
+// deliberately-overlapping user-placed pair (created a fraction of a
+// world unit apart) within a few steps.
+const COLLISION_RADIUS_BASE = 0.35;
+function collisionRadiusFor(massEarth) {
+  return COLLISION_RADIUS_BASE * Math.cbrt(Math.max(0.01, massEarth));
+}
+
+// Shared display-size formula (system-bodies.js's auto-generation and
+// system-editor.js's creation/mass-adjustment both need it - factored out
+// so the two never quietly drift apart).
+function planetRadiusPxFor(massEarth) {
+  return Math.min(4, Math.max(1.8, 0.9 + Math.cbrt(massEarth) * 0.4));
+}
+
+// Asteroid/comet/moon creation-tool tuning.
+const ASTEROID_MASS_EARTH = 0.1;
+const ASTEROID_BELT_RADIUS = 150;
+const ASTEROID_BELT_JITTER = 12; // +/- sim units around the belt radius
+const COMET_MASS_EARTH = 1.0;
+// A comet is placed near the outer edge of the system with LESS than
+// circular-orbit tangential speed at that radius (a fraction of it) - no
+// special orbital-mechanics code needed, this alone produces a genuinely
+// eccentric ellipse (outer aphelion, close perihelion, back out) under the
+// exact same gravity everything else uses. Verified bounded/periodic/no-NaN
+// empirically (test_comet_stability.js), not just assumed.
+const COMET_SPEED_MULT_MIN = 0.3;
+const COMET_SPEED_MULT_MAX = 0.5;
+const MOON_MASS_FRACTION = 0.1; // spec: "1/10 of planet"
+
+const UNDO_STACK_LIMIT = 10;
+
+// Gravitational constant baseline + the two "System Experiments" presets.
+// Both toggles change this SAME worker-global G that every body's gravity
+// already goes through - there is one shared force-calc path in this
+// project, on purpose, so "G but only for system-view bodies" would be
+// actual special-cased gravity code, which nothing else here does. This is
+// therefore a whole-simulation effect, called out explicitly in the UI
+// rather than done silently. Low Gravity divides by 4, not literally by
+// the same 10x Crazy Physics multiplies by: an abrupt G change on already-
+// moving bodies (whose velocity was tuned for the old G) causes real
+// re-adjustment regardless of direction, and /4 settles into a visibly
+// "weaker, slower, more spread out" regime without reading as pure chaos -
+// which would undercut the contrast with Crazy Physics.
+const DEFAULT_G = 0.6;
+const CRAZY_PHYSICS_G_MULT = 10;
+const LOW_GRAVITY_G_DIV = 4;
+
+const SHARE_FORMAT_VERSION = 1;
 
 // 1 Earth mass in this sim's solar-mass-scaled units. A real, principled
 // conversion (not an empirical fudge like BLACKHOLE_MASS) - it's what keeps
@@ -113,6 +185,13 @@ const PLANET_COMPOSITIONS = [
   { key: 'iron', color: '#c0392b', tempBias: [400, 900] },
   { key: 'airless', color: '#c9ced6', tempBias: [0, 260] },
 ];
+
+// "Change Color" (right-click menu / C key) cycles through the same 4
+// composition presets already used for auto-generation - no new palette.
+function cyclePlanetColor(currentKey) {
+  const i = PLANET_COMPOSITIONS.findIndex((c) => c.key === currentKey);
+  return PLANET_COMPOSITIONS[(i + 1 + PLANET_COMPOSITIONS.length) % PLANET_COMPOSITIONS.length];
+}
 
 // Cumulative weights for O(types) weighted sampling, e.g. [1,3,7,14,25,40,100].
 const STAR_TYPE_CUMULATIVE = (() => {
@@ -156,9 +235,26 @@ if (typeof self !== 'undefined') {
   self.exoticTypeByCode = exoticTypeByCode;
   self.PLANET_TYPE_CODE = PLANET_TYPE_CODE;
   self.SYSTEM_EMPTY_TYPE_CODE = SYSTEM_EMPTY_TYPE_CODE;
-  self.MAX_SYSTEM_BODIES = MAX_SYSTEM_BODIES;
+  self.MAX_AUTO_PLANETS = MAX_AUTO_PLANETS;
+  self.SYSTEM_POOL_CAPACITY = SYSTEM_POOL_CAPACITY;
+  self.COLLISION_RADIUS_BASE = COLLISION_RADIUS_BASE;
+  self.collisionRadiusFor = collisionRadiusFor;
+  self.planetRadiusPxFor = planetRadiusPxFor;
+  self.ASTEROID_MASS_EARTH = ASTEROID_MASS_EARTH;
+  self.ASTEROID_BELT_RADIUS = ASTEROID_BELT_RADIUS;
+  self.ASTEROID_BELT_JITTER = ASTEROID_BELT_JITTER;
+  self.COMET_MASS_EARTH = COMET_MASS_EARTH;
+  self.COMET_SPEED_MULT_MIN = COMET_SPEED_MULT_MIN;
+  self.COMET_SPEED_MULT_MAX = COMET_SPEED_MULT_MAX;
+  self.MOON_MASS_FRACTION = MOON_MASS_FRACTION;
+  self.UNDO_STACK_LIMIT = UNDO_STACK_LIMIT;
+  self.DEFAULT_G = DEFAULT_G;
+  self.CRAZY_PHYSICS_G_MULT = CRAZY_PHYSICS_G_MULT;
+  self.LOW_GRAVITY_G_DIV = LOW_GRAVITY_G_DIV;
+  self.SHARE_FORMAT_VERSION = SHARE_FORMAT_VERSION;
   self.EARTH_MASS_IN_SOLAR = EARTH_MASS_IN_SOLAR;
   self.PLANET_COMPOSITIONS = PLANET_COMPOSITIONS;
+  self.cyclePlanetColor = cyclePlanetColor;
 }
 if (typeof module !== 'undefined') {
   module.exports = {
@@ -168,7 +264,12 @@ if (typeof module !== 'undefined') {
     QUASAR_TYPE_CODE, QUASAR_SPAWN_CHANCE, QUASAR_MASS, QUASAR_CAPTURE_RADIUS,
     QUASAR_DISPLAY_MASS, NEUTRONSTAR_TYPE_CODE, NEUTRONSTAR_SPAWN_CHANCE,
     NEUTRONSTAR_MASS_MIN, NEUTRONSTAR_MASS_MAX, EXOTIC_TYPES, exoticTypeByCode,
-    PLANET_TYPE_CODE, SYSTEM_EMPTY_TYPE_CODE, MAX_SYSTEM_BODIES,
-    EARTH_MASS_IN_SOLAR, PLANET_COMPOSITIONS,
+    PLANET_TYPE_CODE, SYSTEM_EMPTY_TYPE_CODE, MAX_AUTO_PLANETS,
+    SYSTEM_POOL_CAPACITY, COLLISION_RADIUS_BASE, collisionRadiusFor, planetRadiusPxFor,
+    ASTEROID_MASS_EARTH, ASTEROID_BELT_RADIUS, ASTEROID_BELT_JITTER,
+    COMET_MASS_EARTH, COMET_SPEED_MULT_MIN, COMET_SPEED_MULT_MAX,
+    MOON_MASS_FRACTION, UNDO_STACK_LIMIT, DEFAULT_G, CRAZY_PHYSICS_G_MULT,
+    LOW_GRAVITY_G_DIV, SHARE_FORMAT_VERSION,
+    EARTH_MASS_IN_SOLAR, PLANET_COMPOSITIONS, cyclePlanetColor,
   };
 }
